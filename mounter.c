@@ -1291,18 +1291,12 @@ lba2chs(ULONG start, ULONG end, ULONG max_lba, ULONG *cs_p, ULONG *ce_p, ULONG *
 
 static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, ULONG pstart, ULONG plen, ULONG max_lba)
 {
+	struct ExpansionBase *ExpansionBase = md->ExpansionBase;   /* MakeDosNode base */
 	struct FileSysEntry *fse=NULL;
-	char dosName[] = "MS0";
-	static unsigned int cnt = 0;
+	char dosName[] = "\3MS0";   /* BCPL form for CheckDevName; digit at index 3 */
 	LONG bootPri;
 	ULONG pend = pstart + plen - 1;
 	ULONG cs,ce,h,s;
-
-	if (cnt > 9) {
-		printf("Error: Too many partitions, skipping MS%d\n", cnt);
-		cnt++;
-		return -1;
-	}
 
 	if (type != 0x00 && type != 0x01 && type != 0x04 &&
 	    type != 0x06 && type != 0x0B && type != 0x0C && type != 0x0E) {
@@ -1326,7 +1320,7 @@ static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, UL
 
 	memset(&pp,0,sizeof(struct ParameterPacket));
 
-	pp.dosname              = dosName;
+	pp.dosname              = dosName + 1;
 	pp.execname             = md->devicename;
 	pp.unitnum              = md->unitnum;
 	pp.de.de_TableSize      = sizeof(struct DosEnvec);
@@ -1343,7 +1337,19 @@ static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, UL
 	pp.de.de_DosType        = 0x46415401; // FAT95 for now
 	pp.de.de_BootPri        = bootPri;
 
-	dosName[2]='0' + cnt;
+	/* Pick the next free MSn by probing the mount list, like ScanCDROM does for CDn. */
+	for (int i = 0; i < 9; i++) {
+		if (CheckDevName(md, (UBYTE *)dosName)) {
+			dosName[3] += 1;
+		} else {
+			break;
+		}
+	}
+	if (dosName[3] > '9') {            /* all of MS0..MS9 taken */
+		printf("Error: Too many partitions, skipping %s\n", dosName + 1);
+		return -1;
+	}
+
 	struct DeviceNode *node = MakeDosNode(&pp);
 	if (!node) {
 		printf("Could not create DosNode\n");
@@ -1353,7 +1359,6 @@ static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, UL
 	ProcessPatchFlags(node, fse);
 
 	AddBootNode(bootPri, ADNF_STARTPROC, node, md->configDev);
-	cnt++;
 
 	return 1;
 }
@@ -1523,6 +1528,56 @@ static LONG ScanMBR(struct MountData *md)
 }
 #endif
 
+// Probe one unit: open it, read geometry, scan its partition table(s), close.
+// Returns the per-unit result (-1 error/no RDB, 0 none, >0 partitions mounted).
+static LONG ProbeUnit(struct MountData *md, struct MountStruct *ms, ULONG unitNum,
+                      struct IOExtTD *request)
+{
+	struct ExecBase *SysBase = md->SysBase;
+	struct DriveGeometry geom;
+	LONG ret = -1;
+	UBYTE err;
+
+	dbg("OpenDevice('%s', %"PRId32", %p, 0)\n", ms->deviceName, unitNum, request);
+	err = OpenDevice(ms->deviceName, unitNum, (struct IORequest*)request, 0);
+	if (err != 0) {
+		dbg("OpenDevice(%s,%"PRId32") failed: %"PRId32"\n", ms->deviceName, unitNum, (BYTE)err);
+		return -1;
+	}
+	if (GetGeometry(request, &geom) == 0) {
+		md->request    = request;
+		md->devicename = ms->deviceName;
+		md->blocksize  = geom.dg_SectorSize;
+		md->unitnum    = unitNum;
+		switch (geom.dg_DeviceType & SID_TYPE) {
+		case DG_CDROM:
+		case DG_WORM:
+		case DG_OPTICAL_DISK:
+			if (ms->cdBoot)
+				ret = ScanCDROM(md);
+			else
+				printf("CDROM boot disabled.\n");
+			break;
+		case DG_DIRECT_ACCESS:
+			ret = ScanRDSK(md);
+#ifdef DISKLABELS
+			if (ret == -1)
+				ret = ScanMBR(md);
+#endif
+			break;
+		default:
+			printf("Don't know how to boot from device type %d.\n", geom.dg_DeviceType & SID_TYPE);
+			break;
+		}
+	}
+	// Disable motor after probing
+	md->request->iotd_Req.io_Command = TD_MOTOR;
+	md->request->iotd_Req.io_Length  = 0;
+	DoIO((struct IORequest*)md->request);
+	CloseDevice((struct IORequest*)request);
+	return ret;
+}
+
 // Return values:
 // If single unit number:
 // -1 = No RDB found, device failed to open, disk error or RDB block checksum error.
@@ -1538,7 +1593,6 @@ LONG MountDrive(struct MountStruct *ms)
 	struct MsgPort *port = NULL;
 	struct IOExtTD *request = NULL;
 	struct ExpansionBase *ExpansionBase;
-	struct DriveGeometry geom;
 	struct ExecBase *SysBase = ms->SysBase;
 	dbg("Starting..\n");
 	ExpansionBase = (struct ExpansionBase*)OpenLibrary("expansion.library", 34);
@@ -1556,75 +1610,53 @@ LONG MountDrive(struct MountStruct *ms)
 			if(port) {
 				request = (struct IOExtTD*)W_CreateIORequest(port, sizeof(struct IOExtTD), SysBase);
 				if(request) {
-					ULONG target;
-					ULONG lun = 0;
-					for (target = 0; target < 8; target++, lun = 0) {
-						// Skip the host controller ID
-						if (target == ms->hostId)
-							continue;
-						ULONG unitNum;
+					if (ms->unitNum == NULL) {
+						// Legacy full SCSI scan: targets 0-7 (x LUNs).
+						ULONG target;
+						ULONG lun = 0;
+						for (target = 0; target < 8; target++, lun = 0) {
+							// Skip the host controller ID
+							if (target == ms->hostId)
+								continue;
+							ULONG unitNum;
 next_lun:
-						if (target > 7 || lun > 7) {
-							// Phase V wide SCSI scheme for IDs/LUNs > 7
-							unitNum = lun * 10 * 1000 + target * 10 + HD_WIDESCSI;
-						} else {
-							// Traditional scheme for IDs/LUNs <= 7
-							unitNum = target + lun * 10;
-						}
-						dbg("OpenDevice('%s', %"PRId32", %p, 0)\n", ms->deviceName, unitNum, request);
-						UBYTE err = OpenDevice(ms->deviceName, unitNum, (struct IORequest*)request, 0);
-						if (err == 0) {
-							err = GetGeometry(request ,&geom);
-							if (err == 0) {
-								ret = -1;
-								md->request    = request;
-								md->devicename = ms->deviceName;
-								md->blocksize  = geom.dg_SectorSize;
-								md->unitnum    = unitNum;
-
-								switch (geom.dg_DeviceType & SID_TYPE) {
-								case DG_CDROM:
-								case DG_WORM:
-								case DG_OPTICAL_DISK:
-									if (!ms->cdBoot) {
-										printf("CDROM boot disabled.\n");
-										break;
-									}
-									ret = ScanCDROM(md);
-									break;
-
-								case DG_DIRECT_ACCESS: // DISK
-									ret = ScanRDSK(md);
-#ifdef DISKLABELS
-									if (ret==-1)
-										ret = ScanMBR(md);
-#endif
-									break;
-								default:
-									printf("Don't know how to boot from device type %d.\n",
-										geom.dg_DeviceType & SID_TYPE);
-									break;
-								}
+							if (target > 7 || lun > 7) {
+								// Phase V wide SCSI scheme for IDs/LUNs > 7
+								unitNum = lun * 10 * 1000 + target * 10 + HD_WIDESCSI;
+							} else {
+								// Traditional scheme for IDs/LUNs <= 7
+								unitNum = target + lun * 10;
 							}
-
-							// Disable motor after probing
-							md->request->iotd_Req.io_Command = TD_MOTOR;
-							md->request->iotd_Req.io_Length  = 0;
-							DoIO((struct IORequest*)md->request);
-
-							CloseDevice((struct IORequest*)request);
-
-							if (ms->luns && (lun++ < 8) &&
-							    (!md->wasLastLun)) {
+							ret = ProbeUnit(md, ms, unitNum, request);
+							if (ms->luns && (lun++ < 8) && (!md->wasLastLun)) {
 								goto next_lun;
 							}
-
 							if (md->wasLastDev && !ms->ignoreLast) {
 								dbg("RDBFF_LAST exit\n");
 								break;
 							}
+						}
+					} else {
+						// Explicit unit(s): single value (<0x100), else pointer to
+						// { count, unit0, unit1, ... }. Lets a caller mount one known
+						// unit (e.g. a hotplug driver) instead of scanning 0-7.
+						ULONG single[2];
+						ULONG *list;
+						ULONG i, n;
+						if ((ULONG)ms->unitNum < 0x100) {
+							single[0] = 1;
+							single[1] = (ULONG)ms->unitNum;
+							list = single;
 						} else {
-							dbg("OpenDevice(%s,%"PRId32") failed: %"PRId32"\n", ms->deviceName, unitNum, (BYTE)err);
+							list = ms->unitNum;
+						}
+						n = list[0];
+						for (i = 1; i <= n; i++) {
+							ret = ProbeUnit(md, ms, list[i], request);
+							if (md->wasLastDev && !ms->ignoreLast) {
+								dbg("RDBFF_LAST exit\n");
+								break;
+							}
 						}
 					}
 					W_DeleteIORequest(request, SysBase);
