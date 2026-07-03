@@ -90,7 +90,12 @@
 #define dbg
 #endif
 
-#ifndef A4091
+#if defined(MOUNTER_LOG)
+// Host-provided log sink (e.g. the Poseidon debug backend). It may format with
+// exec RawDoFmt, so format strings here use %l-sized conversions only (no %p).
+void mounter_log(const char *fmt, ...);
+#define printf mounter_log
+#elif !defined(A4091)
 #define printf(...)
 #endif
 #define MAX_BLOCKSIZE 2048
@@ -322,7 +327,7 @@ static BOOL readblock(UBYTE *buf, ULONG block, ULONG id, struct MountData *md)
 // Read multiple longs from LSEG blocks
 static BOOL lseg_read_longs(struct MountData *md, ULONG longs, ULONG *data)
 {
-	dbg_lseg("lseg_read_longs, longs %"PRId32"  ptr %p, remaining %"PRId32"\n", longs, data, md->lseglongs);
+	dbg_lseg("lseg_read_longs, longs %"PRId32"  ptr 0x%08lx, remaining %"PRId32"\n", longs, (ULONG)data, md->lseglongs);
 	ULONG cnt = 0;
 	md->lseghasword = FALSE;
 	while (longs > cnt) {
@@ -466,7 +471,7 @@ static APTR fsrelocate(struct MountData *md)
 		if (!rh->hunkData) {
 			goto end;
 		}
-		dbg("hunk %"PRId32": ptr %p, size %"PRId32", memory flags %08"PRIx32"\n", hunkCnt + firstHunk, rh->hunkData, hunkHeadSize, memoryFlags);
+		dbg("hunk %"PRId32": ptr 0x%08lx, size %"PRId32", memory flags %08"PRIx32"\n", hunkCnt + firstHunk, (ULONG)rh->hunkData, hunkHeadSize, memoryFlags);
 		rh->hunkData[0] = rh->hunkSize + 2;
 		rh->hunkData[1] = MKBADDR(prevChunk);
 		prevChunk = &rh->hunkData[1];
@@ -597,7 +602,7 @@ end:
 		firstProcessedHunk = NULL;
 	} else {
 		cacheclear(md);
-		dbg("reloc ok, first hunk %p\n", firstProcessedHunk);
+		dbg("reloc ok, first hunk 0x%08lx\n", (ULONG)firstProcessedHunk);
 	}
 
 	FreeMem(relocHunks, totalHunks * sizeof(struct RelocHunk));
@@ -629,7 +634,7 @@ static struct FileSysEntry *FSHDProcess(struct FileSysHeaderBlock *fshb, ULONG d
 			fsr->fsr_Creator = CreatorStr;
 			AddTail(&SysBase->ResourceList, &fsr->fsr_Node);
 		}
-		dbg("FileSystem.resource created %p\n", fsr);
+		dbg("FileSystem.resource created 0x%08lx\n", (ULONG)fsr);
 	}
 
 	if (fsr) {
@@ -652,8 +657,8 @@ static struct FileSysEntry *FSHDProcess(struct FileSysHeaderBlock *fshb, ULONG d
 			if (found_existing_fse->fse_Version >= version) {
 				if (newOnly) {
 					// Existing entry is suitable, and we only want to add a new one if necessary.
-					dbg("FileSystem.resource scan: Existing up-to-date entry 0x%p for 0x%08X found. Version 0x%08X >= requested 0x%08X. No action needed.\n",
-						found_existing_fse, dostype, found_existing_fse->fse_Version, version);
+					dbg("FileSystem.resource scan: Existing up-to-date entry 0x%08lx for 0x%08lx found. Version 0x%08lx >= requested 0x%08lx. No action needed.\n",
+						(ULONG)found_existing_fse, dostype, found_existing_fse->fse_Version, version);
 					Permit();
 					return NULL; // Indicate no new/updated fse needed from this call
 				} else {
@@ -697,7 +702,7 @@ static struct FileSysEntry *FSHDProcess(struct FileSysHeaderBlock *fshb, ULONG d
 					result_fse->fse_PatchFlags = fshb->fhb_PatchFlags;
 					strcpy((char *)(result_fse + 1), (const char *)creator);
 					result_fse->fse_Node.ln_Name = (UBYTE *)(result_fse + 1);
-					dbg("FileSystem.resource scan: new FileSysEntry 0x%p created for 0x%08X based on fshb.\n", result_fse, dostype);
+					dbg("FileSystem.resource scan: new FileSysEntry 0x%08lx created for 0x%08lx based on fshb.\n", (ULONG)result_fse, dostype);
 				}
 			}
 		} else if (fshb && !newOnly && found_existing_fse) {
@@ -717,13 +722,13 @@ static void FSHDAdd(struct FileSysEntry *fse, struct MountData *md)
 		struct FileSysResource *fsr = OpenResource(FSRNAME);
 		if (fsr) {
 			AddHead(&fsr->fsr_FileSysEntries, &fse->fse_Node);
-			dbg("FileSysEntry %p added to FileSystem.resource, dostype %08"PRIx32"\n", fse, fse->fse_DosType);
+			dbg("FileSysEntry 0x%08lx added to FileSystem.resource, dostype %08"PRIx32"\n", (ULONG)fse, fse->fse_DosType);
 			fse = NULL;
 		}
 		Permit();
 	}
 	if (fse) {
-		dbg("FileSysEntry %p freed, dostype %08"PRIx32"\n", fse, fse->fse_DosType);
+		dbg("FileSysEntry 0x%08lx freed, dostype %08"PRIx32"\n", (ULONG)fse, fse->fse_DosType);
 		FreeMem(fse, sizeof(struct FileSysEntry));
 	}
 }
@@ -929,7 +934,7 @@ static void AddNode(struct PartitionBlock *part, struct ParameterPacket *pp, str
 				name[len++] = ':';
 				name[len] = 0;
 				void * __attribute__((unused)) mp = DeviceProc(name);
-				dbg("DeviceProc() returned %p\n", mp);
+				dbg("DeviceProc() returned 0x%08lx\n", (ULONG)mp);
 			}
 		}
 	}
@@ -1050,7 +1055,6 @@ static struct FileSysEntry *find_filesystem(ULONG id1, ULONG id2, struct ExecBas
 	struct FileSysEntry *fse, *fs=NULL;
 	Forbid();
 	if ((FileSysResBase = (struct FileSysResource *)OpenResource(FSRNAME))) {
-		Forbid();
 		for (fse = (struct FileSysEntry *)FileSysResBase->fsr_FileSysEntries.lh_Head;
 			  fse->fse_Node.ln_Succ;
 			  fse = (struct FileSysEntry *)fse->fse_Node.ln_Succ) {
@@ -1417,11 +1421,11 @@ static LONG ParseMBR(UBYTE *buf, struct MountData *md)
 		if (!part[i].f_lba) {
 			continue;
 		}
-		printf("   %2d   ", i+1);
-		printf("%c   %02x %8x %8x\n", part[i].status & 0x80 ? '*':' ',
-			part[i].type,
-			__bswap32(part[i].f_lba),
-			__bswap32(part[i].num_sect));
+		printf("   %2ld   ", (LONG)(i+1));
+		printf("%lc   %02lx %8lx %8lx\n", (LONG)(part[i].status & 0x80 ? '*':' '),
+			(ULONG)part[i].type,
+			(ULONG)__bswap32(part[i].f_lba),
+			(ULONG)__bswap32(part[i].num_sect));
 
 		if (part[i].type == 5) {
 			readblock(md->buf, __bswap32(part[i].f_lba), 0xffffffff, md);
@@ -1442,12 +1446,12 @@ static void print_guid(GUID *x)
 
 	// Somebody has got to be proud of this mixed endian prank.
 
-	printf("%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-			__bswap32(x->u.UUID.time_low), __bswap16(x->u.UUID.time_mid),
-			__bswap16(x->u.UUID.time_high_and_version),
-			x->u.UUID.clock_seq_high_and_reserved, x->u.UUID.clock_seq_low,
-			x->u.UUID.node[0], x->u.UUID.node[1], x->u.UUID.node[2],
-			x->u.UUID.node[3], x->u.UUID.node[4], x->u.UUID.node[5]);
+	printf("%08lx-%04lx-%04lx-%02lx%02lx-%02lx%02lx%02lx%02lx%02lx%02lx",
+			(ULONG)__bswap32(x->u.UUID.time_low), (ULONG)__bswap16(x->u.UUID.time_mid),
+			(ULONG)__bswap16(x->u.UUID.time_high_and_version),
+			(ULONG)x->u.UUID.clock_seq_high_and_reserved, (ULONG)x->u.UUID.clock_seq_low,
+			(ULONG)x->u.UUID.node[0], (ULONG)x->u.UUID.node[1], (ULONG)x->u.UUID.node[2],
+			(ULONG)x->u.UUID.node[3], (ULONG)x->u.UUID.node[4], (ULONG)x->u.UUID.node[5]);
 }
 
 // Microsoft Basic Data Partition GUID (used for FAT and NTFS)
@@ -1490,7 +1494,9 @@ static LONG ParseGPT(UBYTE *buf, struct MountData *md)
 		uint64_t first_lba = __bswap64(gpt_par->first_lba);
 		uint64_t last_lba = __bswap64(gpt_par->last_lba);
 
-		printf("%d. %8llx - %8llx ", i, first_lba, last_lba);
+		printf("%ld. %08lx%08lx - %08lx%08lx ", (LONG)i,
+				(ULONG)(first_lba >> 32), (ULONG)first_lba,
+				(ULONG)(last_lba >> 32), (ULONG)last_lba);
 		print_guid(&gpt_par->partition_type);
 		printf("\n");
 
@@ -1602,7 +1608,7 @@ LONG MountDrive(struct MountStruct *ms)
 			md->DOSBase = (struct DosLibrary*)OpenLibrary("dos.library", 34);
 			md->SysBase = SysBase;
 			md->ExpansionBase = ExpansionBase;
-			dbg("SysBase=%p ExpansionBase=%p DosBase=%p\n", md->SysBase, md->ExpansionBase, md->DOSBase);
+			dbg("SysBase=0x%08lx ExpansionBase=0x%08lx DosBase=0x%08lx\n", (ULONG)md->SysBase, (ULONG)md->ExpansionBase, (ULONG)md->DOSBase);
 			md->configDev = ms->configDev;
 			md->creator = ms->creatorName;
 			md->slowSpinup = ms->slowSpinup;
