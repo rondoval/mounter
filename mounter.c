@@ -21,9 +21,6 @@
 #ifdef DEBUG_MOUNTER
 #define USE_SERIAL_OUTPUT
 #endif
-#ifdef A4091
-#include "port.h"
-#endif
 
 #include <exec/types.h>
 #include <exec/memory.h>
@@ -47,6 +44,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include <proto/exec.h>
 #include <proto/expansion.h>
@@ -55,16 +53,7 @@
 #include "ndkcompat.h"
 
 #include "mounter.h"
-
-#ifdef A4091
-#include "scsimsg.h"
-#include "device.h"
-#include "a4091.h"
-#include "attach.h"
-#endif
-#ifdef DISKLABELS
 #include "legacy.h"
-#endif
 
 #ifndef SID_TYPE
 #define SID_TYPE 0x1F
@@ -95,10 +84,10 @@
 // exec RawDoFmt, so format strings here use %l-sized conversions only (no %p).
 void mounter_log(const char *fmt, ...);
 #define printf mounter_log
-#elif !defined(A4091)
+#else
 #define printf(...)
 #endif
-#define MAX_BLOCKSIZE 2048
+#define MAX_BLOCKSIZE 4096
 #define LSEG_DATASIZE (512 / 4 - 5)
 
 #if NO_CONFIGDEV
@@ -124,14 +113,64 @@ struct MountData
 	UWORD lseghasword;
 
 	ULONG unitnum;
-	LONG ret;
-	UBYTE buf[MAX_BLOCKSIZE * 3];
 	UBYTE zero[2];
 	BOOL wasLastDev;
 	BOOL wasLastLun;
 	BOOL slowSpinup;
 	int blocksize;
+	ULONG totalsectors;
+
+	ULONG flags;                    /* MSF_* */
+	const struct MountFS *fatFS;
+	const struct MountFS *ntfsFS;
+	const struct MountFS *cdFS;
+	BOOL legacyMounted;             /* per unit, for MSF_LEGACY_FIRST_ONLY */
 };
+
+// Classic recipe: FAT95 dostype, FileSystem.resource only.
+static const struct MountFS defaultFatFS = { 0x46415401, NULL, NULL, NULL, 0, 0, 0 };
+
+// Copy a C string into a freshly allocated BCPL string: length byte, chars, and
+// a trailing NUL (from MEMF_CLEAR) so it doubles as a C string. Used for
+// dn_Handler / de_Control, which the DeviceNode owns for its lifetime — so the
+// allocation is deliberately never freed.
+static UBYTE *AllocBSTR(const UBYTE *s, struct ExecBase *SysBase)
+{
+	int len = strlen((const char *)s);
+	if (len > 255)      // a BSTR length prefix is a single byte
+		len = 255;
+	UBYTE *b = AllocMem(len + 2, MEMF_PUBLIC | MEMF_CLEAR);
+	if (b) {
+		b[0] = len;
+		memcpy(b + 1, s, len);
+	}
+	return b;
+}
+
+// Buffer for a mount's DOS device name, sized like the RDB pb_DriveName[32]
+// field it mirrors: a 32-byte BSTR holds a 31-char name (the RDB limit), and our
+// NUL-terminated convention (length byte + chars + NUL) caps usable names at 30.
+#define DEVNAME_BUFSIZE 32
+
+// Seed a DOS device-name BSTR (length byte, chars, trailing NUL) into the
+// caller's cap-byte buffer. A trailing digit is ensured ("UMSD" -> "UMSD0") so
+// units number from 0; a name already ending in a digit is left as given.
+// CheckAndFixDevName() appends any collision digits later, in the same buffer.
+static void MakeDevName(UBYTE *dst, const UBYTE *s, int cap)
+{
+	// cap-2 chars fit the buffer (length byte + NUL); reserve one more for the
+	// unit digit we may append below.
+	int len = strlen((const char *)s);
+	if (len > cap - 3)
+		len = cap - 3;
+	memcpy(dst + 1, s, len);
+	if (len == 0 || dst[len] < '0' || dst[len] > '9') {
+		dst[len + 1] = '0';
+		len++;
+	}
+	dst[0] = len;
+	dst[len + 1] = 0;
+}
 
 #define SCSI_CD_MAX_TRACKS 100
 #define SCSI_CMD_READ_TOC 0x43
@@ -154,9 +193,6 @@ struct __packed __attribute__((aligned(2))) SCSI_CD_TOC {
     struct SCSI_TOC_TRACK_DESCRIPTOR td[SCSI_CD_MAX_TRACKS];
 };
 
-#ifdef A4091
-#define GetGeometry dev_scsi_get_drivegeometry
-#else
 // Get Block size of unit
 BYTE GetGeometry(struct IOExtTD *req, struct DriveGeometry *geometry)
 {
@@ -171,7 +207,6 @@ BYTE GetGeometry(struct IOExtTD *req, struct DriveGeometry *geometry)
 
 	return DoIO((struct IORequest *)req);
 }
-#endif
 
 static void W_NewList(struct List *new_list)
 {
@@ -258,10 +293,11 @@ static UWORD checksum(UBYTE *buf, struct MountData *md)
 {
 	ULONG chk = 0;
 	ULONG num_longs;
-	(void)md;
 
 	num_longs = (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | (buf[7]);
-	if (num_longs > 65535)
+	// A block's summed-longs count can never exceed the block itself; reject
+	// garbage counts so the checksum loop can't read past the sector buffer.
+	if (num_longs > (ULONG)md->blocksize / sizeof(LONG))
 		return FALSE;
 
 	for (UWORD i = 0; i < (int)(num_longs * sizeof(LONG)); i += 4) {
@@ -287,8 +323,11 @@ static BOOL readblock(UBYTE *buf, ULONG block, ULONG id, struct MountData *md)
 	if (md->slowSpinup)
 		max_retries = 15;
 
-	request->iotd_Req.io_Command = CMD_READ;
-	request->iotd_Req.io_Offset = block * md->blocksize;
+	// Byte offsets past 4GB need TD_READ64 (io_Actual = high 32 bits)
+	uint64_t offset = (uint64_t)block * (ULONG)md->blocksize;
+	request->iotd_Req.io_Command = (offset >> 32) ? TD_READ64 : CMD_READ;
+	request->iotd_Req.io_Actual = offset >> 32;
+	request->iotd_Req.io_Offset = (ULONG)offset;
 	request->iotd_Req.io_Data = buf;
 	request->iotd_Req.io_Length = md->blocksize;
 	for (i = 0; i < max_retries; i++) {
@@ -296,17 +335,6 @@ static BOOL readblock(UBYTE *buf, ULONG block, ULONG id, struct MountData *md)
 		if (!err) {
 			break;
 		}
-#ifdef A4091
-		if (err != ERROR_NOT_READY) {
-			dbg("Read block %"PRIu32" error %"PRId32"\n", block, err);
-			/* Error retry handled in a4091.device, fail quickly here. */
-			i = max_retries;
-			break;
-		}
-		/* Give the drive more time to spin up */
-		dbg("Drive not ready.\n");
-		delay(1000000);
-#endif
 	}
 	if (i == max_retries) {
 		return FALSE;
@@ -734,38 +762,47 @@ static void FSHDAdd(struct FileSysEntry *fse, struct MountData *md)
 }
 
 // Parse FileSystem Header Blocks, load and relocate filesystem if needed.
-static struct FileSysEntry *ParseFSHD(UBYTE *buf, ULONG block, ULONG dostype, struct MountData *md)
+static struct FileSysEntry *ParseFSHD(ULONG block, ULONG dostype, struct MountData *md)
 {
-	struct FileSysHeaderBlock *fshb = (struct FileSysHeaderBlock*)buf;
+	struct ExecBase *SysBase = md->SysBase;
 	struct FileSysEntry *fse = NULL;
+	// The FileSysHeaderBlock and its LoadSegBlock chain live in two scratch
+	// sectors that must coexist; both are freed before returning.
+	UBYTE *buf = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
+	UBYTE *segbuf = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
 
-	for (;;) {
-		if (block == 0xffffffff) {
-			break;
-		}
-		if (!readblock(buf, block, IDNAME_FILESYSHEADER, md)) {
-			break;
-		}
-		dbg("FSHD found, block %"PRIu32", dostype %08"PRIx32", looking for dostype %08"PRIx32"\n", block, fshb->fhb_DosType, dostype);
-		if (fshb->fhb_DosType == dostype) {
-			dbg("FSHD dostype match found\n");
-			fse = FSHDProcess(fshb, dostype, fshb->fhb_Version, TRUE, md);
-			if (fse) {
-				md->lsegblock = fshb->fhb_SegListBlocks;
-				md->lsegbuf = (struct LoadSegBlock*)(buf + md->blocksize);
-				md->lseglongs = 0;
-				APTR seg = fsrelocate(md);
-				fse->fse_SegList = MKBADDR(seg);
-				// Add to FileSystem.resource if succeeded, delete entry if failure.
-				FSHDAdd(fse, md);
+	if (buf && segbuf) {
+		struct FileSysHeaderBlock *fshb = (struct FileSysHeaderBlock*)buf;
+		for (;;) {
+			if (block == 0xffffffff) {
+				break;
 			}
-			break;
+			if (!readblock(buf, block, IDNAME_FILESYSHEADER, md)) {
+				break;
+			}
+			dbg("FSHD found, block %"PRIu32", dostype %08"PRIx32", looking for dostype %08"PRIx32"\n", block, fshb->fhb_DosType, dostype);
+			if (fshb->fhb_DosType == dostype) {
+				dbg("FSHD dostype match found\n");
+				fse = FSHDProcess(fshb, dostype, fshb->fhb_Version, TRUE, md);
+				if (fse) {
+					md->lsegblock = fshb->fhb_SegListBlocks;
+					md->lsegbuf = (struct LoadSegBlock*)segbuf;
+					md->lseglongs = 0;
+					APTR seg = fsrelocate(md);
+					fse->fse_SegList = MKBADDR(seg);
+					// Add to FileSystem.resource if succeeded, delete entry if failure.
+					FSHDAdd(fse, md);
+				}
+				break;
+			}
+			block = fshb->fhb_Next;
 		}
-		block = fshb->fhb_Next;
 	}
 	if (!fse) {
 		fse = FSHDProcess(NULL, dostype, 0, FALSE, md);
 	}
+	if (segbuf) FreeMem(segbuf, MAX_BLOCKSIZE);
+	if (buf)    FreeMem(buf, MAX_BLOCKSIZE);
 	return fse;
 }
 
@@ -855,41 +892,57 @@ static bool CheckDevName(struct MountData *md, UBYTE *bname)
 	}
 
 	Permit();
+
+	// Post-boot mounts go straight to the DOS lists, not eb_MountList — check
+	// those too (devices, volumes and assigns all claim the name).
+	if (!found && md->DOSBase && md->DOSBase->dl_lib.lib_Version >= 36) {
+		struct DosLibrary *DOSBase = md->DOSBase;
+		struct DosList *dl = LockDosList(LDF_ALL | LDF_READ);
+		if (FindDosEntry(dl, (STRPTR)(bname + 1), LDF_ALL)) {
+			found = true;
+		}
+		UnLockDosList(LDF_ALL | LDF_READ);
+	}
 	return found;
 }
 
-// Check for duplicate device names
-static void CheckAndFixDevName(struct MountData *md, UBYTE *bname)
+// Bump the trailing decimal number ("UMSD0" -> "UMSD1", "UMSD9" -> "UMSD10")
+// until the name collides with nothing. A name without a trailing number
+// (RDB partition names) gets "1" appended on its first collision.
+//
+// bname is a NUL-terminated BSTR (length byte, chars, trailing NUL) living in
+// a buffer of 'cap' bytes, so the longest name it can hold is cap-2 chars (one
+// byte for the length prefix, one for the NUL). Every write below is bounded by
+// that limit: the tail digit lands at most at name[maxlen-1], and a grown name
+// plus its NUL occupy through name[maxlen] == bname[cap-1], the last byte.
+static void CheckAndFixDevName(struct MountData *md, UBYTE *bname, int cap)
 {
-	struct ExecBase *SysBase = md->SysBase;
-
-	Forbid();
-	struct BootNode *bn = (struct BootNode*)md->ExpansionBase->MountList.lh_Head;
-	while (bn->bn_Node.ln_Succ) {
-		struct DeviceNode *dn = bn->bn_DeviceNode;
-		const UBYTE *bname2 = BADDR(dn->dn_Name);
-		if (CompareBSTRNoCase(bname, bname2)) {
-			UBYTE len = bname[0] > 30 ? 30 : bname[0];
-			UBYTE *name = bname + 1;
-			dbg("Duplicate device name '%s'\n", name);
-			if (len > 2 && name[len - 2] == '.' && name[len - 1] >= '0' && name[len - 1] < '9') {
-				// if already ends to .<digit>: increase digit by one
-				name[len - 1]++;
-			} else {
-				// else append .1
-				name[len++] = '.';
-				name[len++] = '1';
-				name[len] = 0;
-				bname[0] += 2;
-			}
-			dbg("-> new device name '%s'\n", name);
-			// retry
-			bn = (struct BootNode*)md->ExpansionBase->MountList.lh_Head;
-			continue;
+	int maxlen = cap - 2;
+	while (CheckDevName(md, bname)) {
+		UBYTE len = bname[0] > maxlen ? maxlen : bname[0];
+		UBYTE *name = bname + 1;
+		dbg("Duplicate device name '%s'\n", name);
+		WORD pos = len - 1;
+		while (pos >= 0 && name[pos] == '9') {
+			name[pos--] = '0';
 		}
-		bn = (struct BootNode*)bn->bn_Node.ln_Succ;
+		if (pos >= 0 && name[pos] >= '0' && name[pos] <= '8') {
+			name[pos]++;
+		} else if (len < maxlen) {
+			// no digit to bump: insert '1' before the carried zeros
+			// (appends when there was no trailing number at all)
+			for (WORD i = len; i > pos + 1; i--) {
+				name[i] = name[i - 1];
+			}
+			name[pos + 1] = '1';
+			name[++len] = 0;
+			bname[0] = len;
+		} else {
+			// no room to grow; give up rather than loop forever
+			break;
+		}
+		dbg("-> new device name '%s'\n", name);
 	}
-	Permit();
 }
 
 // Add DeviceNode to Expansion MountList.
@@ -900,6 +953,8 @@ static void AddNode(struct PartitionBlock *part, struct ParameterPacket *pp, str
 	struct DosLibrary *DOSBase = md->DOSBase;
 
 	LONG bootPri = (part->pb_Flags & PBFF_BOOTABLE) ? pp->de.de_BootPri : -128;
+	if (md->flags & MSF_NO_BOOT)
+		bootPri = -128;
 	if (ExpansionBase->LibNode.lib_Version >= 37) {
 		// KS 2.0+
 		if (!md->DOSBase && bootPri > -128) {
@@ -928,12 +983,18 @@ static void AddNode(struct PartitionBlock *part, struct ParameterPacket *pp, str
 			dbg("KS13: Mounting as non-bootable\n");
 			AddDosNode(bootPri, 0, dn);
 			if (md->DOSBase) {
-				// KS 1.3 ADNF_STARTPROC is not supported
-				// need to use DeviceProc() to start the filesystem process.
+				// KS 1.3 ADNF_STARTPROC is not supported; start the filesystem
+				// process via DeviceProc(). Build "<name>:" in a local buffer —
+				// appending ':' into 'name' (a pointer into the 32-byte
+				// pb_DriveName) would overflow the field for a full-length name.
+				UBYTE devpath[36];
 				UWORD len = strlen(name);
-				name[len++] = ':';
-				name[len] = 0;
-				void * __attribute__((unused)) mp = DeviceProc(name);
+				if (len > (int)sizeof(devpath) - 2)
+					len = (int)sizeof(devpath) - 2;
+				memcpy(devpath, name, len);
+				devpath[len++] = ':';
+				devpath[len] = 0;
+				void * __attribute__((unused)) mp = DeviceProc(devpath);
 				dbg("DeviceProc() returned 0x%08lx\n", (ULONG)mp);
 			}
 		}
@@ -964,8 +1025,53 @@ static void ProcessPatchFlags(struct DeviceNode *dn, struct FileSysEntry *fse)
 		dn->dn_GlobalVec = fse->fse_GlobalVec;
 }
 
-// Parse PART block, mount drive.
-static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct MountData *md)
+static struct FileSysEntry *find_filesystem(ULONG id1, ULONG id2, struct ExecBase *SysBase);
+
+// TRUE if the recipe can resolve to a working filesystem: the dostype is
+// registered in FileSystem.resource or a handler file is given. Checked
+// before creating a DeviceNode so unresolvable partitions are skipped clean.
+static BOOL FileSystemAvailable(struct MountData *md, const struct MountFS *fs)
+{
+	return find_filesystem(fs->dosType, 0, md->SysBase) != NULL || fs->handler != NULL;
+}
+
+// Attach handler information to a fresh DeviceNode: the FileSystem.resource
+// entry if the dostype is registered, else the recipe's handler file (loaded
+// by DOS on first access).
+static BOOL SetupFileSystem(struct MountData *md, struct DeviceNode *dn, const struct MountFS *fs)
+{
+	struct ExecBase *SysBase = md->SysBase;
+	struct FileSysEntry *fse = find_filesystem(fs->dosType, 0, SysBase);
+	if (fse) {
+		ProcessPatchFlags(dn, fse);
+		return TRUE;
+	}
+	if (fs->handler) {
+		UBYTE *hb = AllocBSTR(fs->handler, SysBase);
+		if (hb) {
+			dn->dn_Handler = MKBADDR(hb);
+			dn->dn_GlobalVec = (BPTR)-1;   /* C handler convention */
+			dn->dn_StackSize = fs->stackSize ? fs->stackSize : 8192;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+// Add a legacy/CD DeviceNode: bootable only pre-DOS, same rule as AddNode().
+static void AddLegacyNode(struct MountData *md, LONG bootPri, struct DeviceNode *dn)
+{
+	struct ExpansionBase *ExpansionBase = md->ExpansionBase;
+	if (!md->DOSBase && bootPri > -128 && !(md->flags & MSF_NO_BOOT)) {
+		AddBootNode(bootPri, ADNF_STARTPROC, dn, md->configDev);
+	} else {
+		AddDosNode(bootPri, ADNF_STARTPROC, dn);
+	}
+}
+
+// Parse PART block, mount drive. Returns the next PART block in the chain;
+// increments *mounted on success (the return slot is taken by the chain link).
+static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct MountData *md, LONG *mounted)
 {
 	struct ExecBase *SysBase = md->SysBase;
 	struct ExpansionBase *ExpansionBase = md->ExpansionBase;
@@ -982,14 +1088,20 @@ static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct Mount
 		if (pp) {
 			UBYTE len;
 			copymem(&pp->de, &part->pb_Environment, (part->pb_Environment[0] + 1) * sizeof(ULONG));
-			struct FileSysEntry *fse = ParseFSHD(buf + md->blocksize, filesysblock, pp->de.de_DosType, md);
+			struct FileSysEntry *fse = ParseFSHD(filesysblock, pp->de.de_DosType, md);
 			pp->execname = md->devicename;
 			pp->unitnum = md->unitnum;
 			pp->dosname = part->pb_DriveName + 1;
-			len=(*part->pb_DriveName) > 30 ? 30 : (*part->pb_DriveName);
+			// The RDB length byte is untrusted disk data. Clamp both it and the
+			// content to what the field holds (length byte + chars + NUL) so every
+			// downstream BSTR/C-string view of the name agrees on the length.
+			len = *part->pb_DriveName;
+			if (len > (int)sizeof(part->pb_DriveName) - 2)
+				len = (int)sizeof(part->pb_DriveName) - 2;
+			part->pb_DriveName[0] = len;
 			part->pb_DriveName[len + 1] = 0;
 			dbg("PART '%s'\n", pp->dosname);
-			CheckAndFixDevName(md, part->pb_DriveName);
+			CheckAndFixDevName(md, part->pb_DriveName, sizeof(part->pb_DriveName));
 			struct DeviceNode *dn = MakeDosNode(pp);
 			if (dn) {
 				if (fse) {
@@ -1002,7 +1114,7 @@ static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct Mount
 				}
 #endif
 				AddNode(part, pp, dn, part->pb_DriveName + 1, md);
-				md->ret++;
+				(*mounted)++;
 			} else {
 				dbg("Device node creation failed\n");
 			}
@@ -1012,40 +1124,46 @@ static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct Mount
 	return nextpartblock;
 }
 
-// Scan PART blocks
+// Scan PART blocks. Returns the number of partitions mounted from this disk.
 static LONG ParseRDSK(UBYTE *buf, struct MountData *md)
 {
 	struct RigidDiskBlock *rdb = (struct RigidDiskBlock*)buf;
 	ULONG partblock = rdb->rdb_PartitionList;
 	ULONG filesysblock = rdb->rdb_FileSysHeaderList;
 	ULONG flags = rdb->rdb_Flags;
+	LONG mounted = 0;
 	for (;;) {
 		if (partblock == 0xffffffff) {
 			break;
 		}
-		partblock = ParsePART(buf, partblock, filesysblock, md);
+		partblock = ParsePART(buf, partblock, filesysblock, md, &mounted);
 	}
 
 	md->wasLastDev = (flags & RDBFF_LAST) != 0;
 	md->wasLastLun = (flags & RDBFF_LASTLUN) != 0;
 
-	return md->ret;
+	return mounted;
 }
 
 // Search for RDB
 static LONG ScanRDSK(struct MountData *md)
 {
+	struct ExecBase *SysBase = md->SysBase;
+	UBYTE *buf = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
+	if (!buf)
+		return -1;
 	LONG ret = -1;
 	for (UWORD i = 0; i < RDB_LOCATION_LIMIT; i++) {
-		if (readblock(md->buf, i, 0xffffffff, md)) {
-			struct RigidDiskBlock *rdb = (struct RigidDiskBlock*)md->buf;
+		if (readblock(buf, i, 0xffffffff, md)) {
+			struct RigidDiskBlock *rdb = (struct RigidDiskBlock*)buf;
 			if (rdb->rdb_ID == IDNAME_RIGIDDISK) {
 				dbg("RDB found, block %"PRIu32"\n", i);
-				ret = ParseRDSK(md->buf, md);
+				ret = ParseRDSK(buf, md);
 				break;
 			}
 		}
 	}
+	FreeMem(buf, MAX_BLOCKSIZE);
 	return ret;
 }
 
@@ -1194,13 +1312,64 @@ done:
 	return ret;
 }
 
-// Search for Bootable CDROM
+// Build a DeviceNode from a MountFS recipe plus a block extent, load its
+// handler, and add it to the mount list. lowCyl/highCyl bound the partition in
+// blocks (Surfaces/SectorPerBlock/BlocksPerTrack are all 1, so one block is one
+// "cylinder"); pass 0/0 for a whole-medium device such as a CD. Returns 1 on
+// success, -1 on failure. The CD and MBR/GPT paths differ only in that extent;
+// the RDB path fills its DosEnvec from disk instead and does not use this.
+static LONG mount_recipe(struct MountData *md, const struct MountFS *fs,
+                         const UBYTE *dosName, LONG bootPri,
+                         ULONG lowCyl, ULONG highCyl)
+{
+	struct ExpansionBase *ExpansionBase = md->ExpansionBase;   /* MakeDosNode base */
+	struct ParameterPacket pp;
+
+	memset(&pp, 0, sizeof(pp));
+	pp.dosname              = dosName + 1;
+	pp.execname             = md->devicename;
+	pp.unitnum              = md->unitnum;
+	pp.de.de_TableSize      = 16; // up to DE_DOSTYPE
+	pp.de.de_SizeBlock      = md->blocksize >> 2;
+	pp.de.de_Surfaces       = 1;
+	pp.de.de_SectorPerBlock = 1;
+	pp.de.de_BlocksPerTrack = 1;
+	pp.de.de_LowCyl         = lowCyl;
+	pp.de.de_HighCyl        = highCyl;
+	pp.de.de_NumBuffers     = fs->buffers ? fs->buffers : 5;
+	pp.de.de_BufMemType     = MEMF_ANY|MEMF_CLEAR;
+	pp.de.de_MaxTransfer    = fs->maxTransfer ? fs->maxTransfer : 0x100000;
+	pp.de.de_Mask           = 0x7FFFFFFE;
+	pp.de.de_DosType        = fs->dosType;
+	pp.de.de_BootPri        = bootPri;
+	if (fs->control) {
+		UBYTE *cb = AllocBSTR(fs->control, md->SysBase);   /* lives in the DeviceNode */
+		if (cb) {
+			pp.de.de_Control   = (ULONG)MKBADDR(cb);
+			pp.de.de_TableSize = 19;   // up to de_BootBlocks, includes de_Control
+		}
+	}
+
+	struct DeviceNode *node = MakeDosNode(&pp);
+	if (!node) {
+		printf("Could not create DosNode\n");
+		return -1;
+	}
+	if (!SetupFileSystem(md, node, fs)) {
+		printf("Could not load filesystem\n");
+		return -1;
+	}
+	AddLegacyNode(md, bootPri, node);
+	return 1;
+}
+
+// Mount a data CDROM (Amiga-bootable ones get boot priority)
 static LONG ScanCDROM(struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
-	struct ExpansionBase *ExpansionBase = md->ExpansionBase;
-	struct FileSysEntry *fse=NULL;
-	char dosName[] = "\3CD0"; // BCPL string
+	const struct MountFS *fs = md->cdFS;
+	struct MountFS classicCD;
+	UBYTE dosName[DEVNAME_BUFSIZE];
 	LONG bootPri;
 	LONG isBootable;
 
@@ -1215,6 +1384,8 @@ static LONG ScanCDROM(struct MountData *md)
 
 	if (isBootable == -1) {
 		// ISO PVD Not found, RDB CD?
+		if (md->flags & MSF_NO_RDB)
+			return -1;
 		return ScanRDSK(md);
 	} else {
 		if (isBootable) {
@@ -1224,220 +1395,265 @@ static LONG ScanCDROM(struct MountData *md)
 		}
 	}
 
-	fse=find_filesystem(0x43443031, 0x43445644, md->SysBase);
-	if (!fse) {
-		printf("Could not load filesystem\n");
-		return -1;
-	}
-
-	struct ParameterPacket pp;
-
-	memset(&pp,0,sizeof(struct ParameterPacket));
-
-	pp.dosname              = dosName + 1;
-	pp.execname             = md->devicename;
-	pp.unitnum              = md->unitnum;
-	pp.de.de_TableSize      = 16; // Up to DE_DOSTYPE
-	pp.de.de_SizeBlock      = 2048 >> 2;
-	pp.de.de_Surfaces       = 1;
-	pp.de.de_SectorPerBlock = 1;
-	pp.de.de_BlocksPerTrack = 1;
-	pp.de.de_NumBuffers     = 5;
-	pp.de.de_BufMemType     = MEMF_ANY|MEMF_CLEAR;
-	pp.de.de_MaxTransfer    = 0x100000;
-	pp.de.de_Mask           = 0x7FFFFFFE;
-	pp.de.de_DosType        = fse->fse_DosType; // CD01 / CDVD
-	pp.de.de_BootPri        = bootPri;
-
-	for (int i=0; i<9; i++) {
-		if (CheckDevName(md,dosName)) {
-			dosName[3] += 1;
-		} else {
-			break;
+	if (!fs) {
+		// No recipe: classic behavior, CD01/CDVD from FileSystem.resource only.
+		struct FileSysEntry *fse = find_filesystem(0x43443031, 0x43445644, md->SysBase);
+		if (!fse) {
+			printf("Could not load filesystem\n");
+			return -1;
 		}
-	}
-
-	struct DeviceNode *node = MakeDosNode(&pp);
-	if (!node) {
-		printf("Could not create DosNode\n");
+		memset(&classicCD, 0, sizeof(classicCD));
+		classicCD.dosType = fse->fse_DosType; // CD01 / CDVD
+		fs = &classicCD;
+	} else if (!FileSystemAvailable(md, fs)) {
+		printf("No filesystem for dostype 0x%08lx\n", fs->dosType);
 		return -1;
 	}
 
-	ProcessPatchFlags(node, fse);
+	MakeDevName(dosName, fs->dosName ? fs->dosName : (const UBYTE *)"CD0", sizeof(dosName));
+	CheckAndFixDevName(md, dosName, sizeof(dosName));
 
-	AddBootNode(bootPri, ADNF_STARTPROC, node, md->configDev);
-
-	return 1;
+	// Whole-medium mount: the CD filesystem reads the disc directly, so LowCyl/
+	// HighCyl are left at 0.
+	return mount_recipe(md, fs, dosName, bootPri, 0, 0);
 }
 
-#ifdef DISKLABELS
+/* DetectVBR() results */
+#define VBR_NONE  0
+#define VBR_FAT   1
+#define VBR_NTFS  2
+#define VBR_EXFAT 3
 
-static void
-lba2chs(ULONG start, ULONG end, ULONG max_lba, ULONG *cs_p, ULONG *ce_p, ULONG *h_p, ULONG *s_p)
+// Classify one block as a filesystem Volume Boot Record. A VBR ends in 0x55AA
+// just like an MBR, so the BPB fields must be validated to tell a superfloppy
+// (filesystem at block 0) from a partition table.
+static int DetectVBR(const UBYTE *b, int blocksize)
 {
-    ULONG cs = start >> 1;
-    ULONG ce = end >> 1;
-    ULONG cm = max_lba >> 1;
-    ULONG h = 2;
-    ULONG s = 1;
-    while ((cm >= 10000) && (s < 32)) {
-        cm >>= 2;
-        cs >>= 2;
-        ce >>= 2;
-        h <<= 1;
-        s <<= 1;
-    }
-    *cs_p = cs;
-    *ce_p = ce;
-    *h_p = h;
-    *s_p = s;
+	if (b[510] != 0x55 || b[511] != 0xaa)
+		return VBR_NONE;
+	if (memcmp(b + 3, "NTFS    ", 8) == 0)
+		return VBR_NTFS;
+	if (memcmp(b + 3, "EXFAT   ", 8) == 0)
+		return VBR_EXFAT;
+	if (b[0] != 0xeb && b[0] != 0xe9)          /* x86 jump opcode */
+		return VBR_NONE;
+	int bps = b[11] | (b[12] << 8);            /* BPB fields are little endian */
+	UBYTE spc = b[13];
+	if (bps != blocksize)
+		return VBR_NONE;
+	if (spc == 0 || (spc & (spc - 1)) != 0)    /* sectors/cluster: power of two */
+		return VBR_NONE;
+	if (b[16] != 1 && b[16] != 2)              /* number of FATs */
+		return VBR_NONE;
+	return VBR_FAT;
 }
 
-static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, ULONG pstart, ULONG plen, ULONG max_lba)
+static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, ULONG pstart, ULONG plen)
 {
-	struct ExpansionBase *ExpansionBase = md->ExpansionBase;   /* MakeDosNode base */
-	struct FileSysEntry *fse=NULL;
-	char dosName[] = "\3MS0";   /* BCPL form for CheckDevName; digit at index 3 */
-	LONG bootPri;
+	struct ExecBase *SysBase = md->SysBase;
+	const struct MountFS *fs = NULL;
+	UBYTE dosName[DEVNAME_BUFSIZE];
+	LONG bootPri = bootable ? 0 : -1;
 	ULONG pend = pstart + plen - 1;
-	ULONG cs,ce,h,s;
 
-	if (type != 0x00 && type != 0x01 && type != 0x04 &&
-	    type != 0x06 && type != 0x0B && type != 0x0C && type != 0x0E) {
-		printf("Warning: Partition type 0x%02x may not be FAT\n", type);
-	}
+	if ((md->flags & MSF_LEGACY_FIRST_ONLY) && md->legacyMounted)
+		return 0;
 
-	bootPri = bootable ? 0 : -1;
-
-	lba2chs(pstart,pend, max_lba, &cs, &ce, & h, &s);
-
-	printf("register_legacy: %d - %d  (%d/%d/%d - %d/%d/%d)\n",
-			pstart, pend, cs,h,s,ce,h,s);
-
-	fse=find_filesystem(0x46415401, 0, md->SysBase);
-	if (!fse) {
-		printf("Could not load filesystem\n");
+	// The MBR type byte / GPT type GUID only got us here; the partition's own
+	// boot sector decides the filesystem (0x07 is NTFS or exFAT, sticks are
+	// often mislabeled). Sniff it, in a buffer the caller's table doesn't use.
+	UBYTE *vbr = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
+	if (!vbr)
 		return -1;
-	}
-
-	struct ParameterPacket pp;
-
-	memset(&pp,0,sizeof(struct ParameterPacket));
-
-	pp.dosname              = dosName + 1;
-	pp.execname             = md->devicename;
-	pp.unitnum              = md->unitnum;
-	pp.de.de_TableSize      = sizeof(struct DosEnvec);
-	pp.de.de_SizeBlock      = 512 >> 2;
-	pp.de.de_Surfaces       = h;
-	pp.de.de_SectorPerBlock = 1;
-	pp.de.de_BlocksPerTrack = s;
-	pp.de.de_LowCyl         = cs;
-	pp.de.de_HighCyl        = ce;
-	pp.de.de_NumBuffers     = 5;
-	pp.de.de_BufMemType     = MEMF_ANY|MEMF_CLEAR;
-	pp.de.de_MaxTransfer    = 0x100000;
-	pp.de.de_Mask           = 0x7FFFFFFE;
-	pp.de.de_DosType        = 0x46415401; // FAT95 for now
-	pp.de.de_BootPri        = bootPri;
-
-	/* Pick the next free MSn by probing the mount list, like ScanCDROM does for CDn. */
-	for (int i = 0; i < 9; i++) {
-		if (CheckDevName(md, (UBYTE *)dosName)) {
-			dosName[3] += 1;
-		} else {
-			break;
-		}
-	}
-	if (dosName[3] > '9') {            /* all of MS0..MS9 taken */
-		printf("Error: Too many partitions, skipping %s\n", dosName + 1);
+	int vbrType = readblock(vbr, pstart, 0xffffffff, md) ? DetectVBR(vbr, md->blocksize) : -1;
+	FreeMem(vbr, MAX_BLOCKSIZE);
+	if (vbrType < 0)
 		return -1;
+	switch (vbrType) {
+	case VBR_FAT:
+		fs = md->fatFS ? md->fatFS : &defaultFatFS;
+		break;
+	case VBR_NTFS:
+		fs = md->ntfsFS;   /* NULL: host mounts no NTFS */
+		break;
+	default:
+		break;
+	}
+	if (!fs) {
+		printf("Skipping partition at %lu (type 0x%02lx): unsupported filesystem\n",
+		       pstart, (ULONG)type);
+		return 0;
+	}
+	if (!FileSystemAvailable(md, fs)) {
+		printf("Skipping partition at %lu: no filesystem for dostype 0x%08lx\n",
+		       pstart, fs->dosType);
+		return 0;
 	}
 
-	struct DeviceNode *node = MakeDosNode(&pp);
-	if (!node) {
-		printf("Could not create DosNode\n");
-		return -1;
-	}
+	printf("register_legacy: %lu - %lu\n", pstart, pend);
 
-	ProcessPatchFlags(node, fse);
+	MakeDevName(dosName, fs->dosName ? fs->dosName : (const UBYTE *)"MS0", sizeof(dosName));
+	CheckAndFixDevName(md, dosName, sizeof(dosName));
 
-	AddBootNode(bootPri, ADNF_STARTPROC, node, md->configDev);
-
-	return 1;
+	// Map the partition's block range straight to LowCyl/HighCyl (one block per
+	// cylinder). The old CHS fitting rounded the start down and corrupted
+	// unaligned partitions.
+	LONG ret = mount_recipe(md, fs, dosName, bootPri, pstart, pend);
+	if (ret > 0)
+		md->legacyMounted = TRUE;
+	return ret;
 }
 
 #define MAX_EXTENDED_PARTITIONS 16
 
-unsigned long parse_extended(struct MountData *md, int extended, unsigned long start, unsigned long max_lba)
+// 0x05 = CHS extended, 0x0F = LBA extended (the common one), 0x85 = Linux extended.
+static BOOL IsExtendedType(UBYTE type)
 {
-	struct mbr *mbr = (struct mbr *)md->buf;
-	unsigned long new_start;
+	return type == 0x05 || type == 0x0f || type == 0x85;
+}
 
-	if (extended > 4 + MAX_EXTENDED_PARTITIONS) {
-		printf("Warning: Extended partition limit (%d) reached\n",
-		       MAX_EXTENDED_PARTITIONS);
+// Walk the EBR chain of the extended partition starting at 'base'. Logical
+// partition offsets are relative to their own EBR; the next-EBR link is
+// relative to the extended container base. Returns partitions mounted.
+static LONG parse_extended(struct MountData *md, ULONG base)
+{
+	struct ExecBase *SysBase = md->SysBase;
+	UBYTE *buf = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
+	if (!buf)
 		return 0;
+	struct mbr *mbr = (struct mbr *)buf;
+	ULONG ebr = base;
+	LONG mounted = 0;
+	int n;
+
+	for (n = 0; n < MAX_EXTENDED_PARTITIONS; n++) {
+		if (!readblock(buf, ebr, 0xffffffff, md))
+			break;
+		if (mbr->sig[0] != 0x55 || mbr->sig[1] != 0xaa)
+			break;
+		// Slot 0 is the logical partition, slot 1 links to the next EBR. Read
+		// them straight from buf — register_legacy() below reads into its own
+		// sector, so buf survives intact until the next iteration overwrites it.
+		struct mbr_partition *logical = &mbr->part[0];
+		struct mbr_partition *link    = &mbr->part[1];
+
+		if (logical->type != 0 && logical->num_sect != 0) {
+			printf("   %2ld   ", (LONG)(5 + n));
+			printf("%lc   %02lx %8lx %8lx\n", (LONG)(logical->status & 0x80 ? '*':' '),
+					(ULONG)logical->type,
+					ebr + __bswap32(logical->f_lba),
+					(ULONG)__bswap32(logical->num_sect));
+			if (register_legacy(md, logical->status & 0x80, logical->type,
+					ebr + __bswap32(logical->f_lba),
+					__bswap32(logical->num_sect)) > 0)
+				mounted++;
+		}
+
+		if (!IsExtendedType(link->type) || link->num_sect == 0)
+			break;
+		ebr = base + __bswap32(link->f_lba);
 	}
+	if (n == MAX_EXTENDED_PARTITIONS)
+		printf("Warning: Extended partition limit (%ld) reached\n",
+		       (LONG)MAX_EXTENDED_PARTITIONS);
+	FreeMem(buf, MAX_BLOCKSIZE);
+	return mounted;
+}
 
-	printf("   %2d   ", extended++);
-	printf("%c   %02x %8lx %8lx\n", mbr->part[0].status & 0x80 ? '*':' ',
-			mbr->part[0].type,
-			start + __bswap32(mbr->part[0].f_lba),
-			(unsigned long)__bswap32(mbr->part[0].num_sect));
-
-	register_legacy(md, mbr->part[0].status & 0x80, mbr->part[0].type,
-			start + __bswap32(mbr->part[0].f_lba),
-			__bswap32(mbr->part[0].num_sect), max_lba);
-
-	new_start = __bswap32(mbr->part[1].f_lba);
-
-	if (mbr->part[1].type == 5) {
-		readblock(md->buf, start + new_start, 0xffffffff, md);
-		parse_extended(md, extended, start + new_start, max_lba);
+// Any 0xEE slot marks the disk GPT, whether protective (covers the whole
+// disk) or hybrid (real entries alongside). Per UEFI spec this gates GPT.
+static BOOL HasProtectiveEntry(const struct mbr *mbr)
+{
+	for (int i = 0; i < 4; i++) {
+		if (mbr->part[i].type == 0xee)
+			return TRUE;
 	}
+	return FALSE;
+}
 
-	return 0;
+// CRC-32 (reflected, poly 0xEDB88320), bitwise: only ever run over one ~92-byte
+// header, not worth a table.
+static ULONG crc32(const UBYTE *p, ULONG len)
+{
+	ULONG crc = 0xFFFFFFFF;
+	while (len--) {
+		crc ^= *p++;
+		for (int i = 0; i < 8; i++)
+			crc = (crc >> 1) ^ (0xEDB88320UL & (0UL - (crc & 1)));
+	}
+	return ~crc;
+}
+
+// UEFI-spec GPT header check: signature, the header must claim to live at the
+// LBA it was read from, sane size, and the self-CRC32. This is what tells a
+// live GPT from a stale header left at block 1 by an earlier repartitioning.
+// (The entry-array CRC is skipped; ParseGPT bounds-checks what it reads.)
+static BOOL ValidGPTHeader(struct gpt *gpt, struct MountData *md)
+{
+	if (memcmp(gpt->signature, "EFI PART", 8) != 0)
+		return FALSE;
+	if (__bswap64(gpt->my_lba) != 1)
+		return FALSE;
+	ULONG size = __bswap32(gpt->size);
+	if (size < sizeof(struct gpt) || size > (ULONG)md->blocksize)
+		return FALSE;
+	ULONG stored = gpt->header_crc32;
+	gpt->header_crc32 = 0;   /* the CRC is computed with its own field zeroed */
+	ULONG computed = crc32((const UBYTE *)gpt, size);
+	gpt->header_crc32 = stored;
+	return computed == __bswap32(stored);
+}
+
+// Reject boot-code garbage that happens to end in 0x55AA (a filesystem VBR does,
+// too): every slot must look like a real entry and at least one must be usable.
+static BOOL SaneMBR(const struct mbr *mbr, ULONG total)
+{
+	int used = 0;
+	for (int i = 0; i < 4; i++) {
+		const struct mbr_partition *p = &mbr->part[i];
+		if (p->status & 0x7f)
+			return FALSE;
+		if (p->type == 0 || p->f_lba == 0 || p->num_sect == 0)
+			continue;
+		if (total && __bswap32(p->f_lba) >= total)
+			return FALSE;
+		used++;
+	}
+	return used > 0;
 }
 
 static LONG ParseMBR(UBYTE *buf, struct MountData *md)
 {
-	int extended = 5;
-	ULONG max_lba = 0;
-
 	struct mbr *mbr = (struct mbr *)buf;
-	struct mbr_partition part[4];
-	int i;
-	// copy because we might overwrite our buffer
-	// with an extended partition
-	for (i=0;i<4;i++) {
-		part[i] = mbr->part[i];
-		if ((__bswap32(mbr->part[i].f_lba) + __bswap32(mbr->part[i].num_sect)) > max_lba)
-			max_lba = __bswap32(mbr->part[i].f_lba) + __bswap32(mbr->part[i].num_sect);
-	}
+	LONG mounted = 0;
 
 	printf(" Part Boot Type   Start   Length\n");
-	for (i=0;i<4;i++) {
-		if (!part[i].f_lba) {
+	// The mount helpers below read into their own sectors, so buf (the MBR)
+	// stays valid across the loop — index the four entries in place.
+	for (int i = 0; i < 4; i++) {
+		struct mbr_partition *p = &mbr->part[i];
+		if (p->type == 0 || p->f_lba == 0 || p->num_sect == 0) {
 			continue;
 		}
 		printf("   %2ld   ", (LONG)(i+1));
-		printf("%lc   %02lx %8lx %8lx\n", (LONG)(part[i].status & 0x80 ? '*':' '),
-			(ULONG)part[i].type,
-			(ULONG)__bswap32(part[i].f_lba),
-			(ULONG)__bswap32(part[i].num_sect));
+		printf("%lc   %02lx %8lx %8lx\n", (LONG)(p->status & 0x80 ? '*':' '),
+			(ULONG)p->type,
+			(ULONG)__bswap32(p->f_lba),
+			(ULONG)__bswap32(p->num_sect));
 
-		if (part[i].type == 5) {
-			readblock(md->buf, __bswap32(part[i].f_lba), 0xffffffff, md);
-			parse_extended(md, extended, __bswap32(part[i].f_lba), max_lba);
+		if (IsExtendedType(p->type)) {
+			mounted += parse_extended(md, __bswap32(p->f_lba));
+		} else if (p->type == 0xee) {
+			// GPT protective entry; GPT itself was already probed at block 1.
 		} else {
-			register_legacy(md, part[i].status & 0x80, part[i].type,
-					__bswap32(part[i].f_lba),
-					__bswap32(part[i].num_sect), max_lba);
+			if (register_legacy(md, p->status & 0x80, p->type,
+					__bswap32(p->f_lba),
+					__bswap32(p->num_sect)) > 0)
+				mounted++;
 		}
 	}
 
-	return md->ret;
+	return mounted;
 }
 
 static void print_guid(GUID *x)
@@ -1466,33 +1682,45 @@ static int guid_equal(const GUID *a, const GUID *b)
 	return memcmp(a->u.raw, b->u.raw, 16) == 0;
 }
 
-static LONG ParseGPT(UBYTE *buf, struct MountData *md)
+static LONG ParseGPT(UBYTE *hdr, struct MountData *md)
 {
-	struct gpt *gpt=(struct gpt *)buf;
-	uint64_t max_lba = __bswap64(gpt->last_usable_lba);
+	struct ExecBase *SysBase = md->SysBase;
+	const struct gpt *gpt=(struct gpt *)hdr;
 	uint64_t pstart = __bswap64(gpt->entries_lba);
 	int numparts = __bswap32(gpt->number_of_entries);
-	int psize = __bswap32(gpt->size_of_entry);
-	int i, pos = 0;
+	const int psize = __bswap32(gpt->size_of_entry);
+	LONG mounted = 0;
 
-	printf(" part start at: %lld\n", pstart);
-	printf(" Number of partitions: %d\n", numparts);
-	printf(" size of entry: %d\n", psize);
+	printf(" Number of partitions: %ld\n", (LONG)numparts);
+	printf(" size of entry: %ld\n", (LONG)psize);
 
-	for (i = 0; i < numparts; i++) {
-		if (i % 4 == 0) {
-			pos = 0;
-			readblock(md->buf, pstart++, 0xffffffff, md);
+	if (psize < (int)sizeof(struct gpt_partition) || psize > md->blocksize)
+		return -1;
+	if (numparts > 128)   /* standard table size; don't chase garbage counts */
+		numparts = 128;
+	const int per_block = md->blocksize / psize;
+
+	// The partition-entry array is read into its own sector; the header stays
+	// in 'hdr' (its fields are still needed) and block 0 is left untouched.
+	UBYTE *buf = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
+	if (!buf)
+		return -1;
+
+	for (int i = 0, pos = 0; i < numparts; i++) {
+		if (pos == 0) {
+			if (!readblock(buf, (ULONG)pstart++, 0xffffffff, md))
+				break;
 		}
-		struct gpt_partition *gpt_par = (struct gpt_partition *)(md->buf + (pos * psize));
-		pos++;
+		struct gpt_partition *gpt_par = (struct gpt_partition *)(buf + (pos * psize));
+		if (++pos == per_block)
+			pos = 0;
 
 		/* skip empty partitions */
 		if (gpt_par->first_lba == 0 && gpt_par->last_lba == 0)
 			continue;
 
-		uint64_t first_lba = __bswap64(gpt_par->first_lba);
-		uint64_t last_lba = __bswap64(gpt_par->last_lba);
+		const uint64_t first_lba = __bswap64(gpt_par->first_lba);
+		const uint64_t last_lba = __bswap64(gpt_par->last_lba);
 
 		printf("%ld. %08lx%08lx - %08lx%08lx ", (LONG)i,
 				(ULONG)(first_lba >> 32), (ULONG)first_lba,
@@ -1500,39 +1728,78 @@ static LONG ParseGPT(UBYTE *buf, struct MountData *md)
 		print_guid(&gpt_par->partition_type);
 		printf("\n");
 
-		if (guid_equal(&gpt_par->partition_type, &GUID_BASIC_DATA)) {
-			register_legacy(md, 0, 0, (ULONG)first_lba,
-					(ULONG)(last_lba - first_lba + 1),
-					(ULONG)max_lba);
-		} else {
+		if (!guid_equal(&gpt_par->partition_type, &GUID_BASIC_DATA)) {
 			printf("   Skipping non-FAT partition type\n");
+			continue;
 		}
+		if ((last_lba >> 32) != 0) {
+			printf("   Skipping partition beyond 2^32 blocks\n");
+			continue;
+		}
+		if (register_legacy(md, 0, 0, (ULONG)first_lba,
+				(ULONG)(last_lba - first_lba + 1)) > 0)
+			mounted++;
 	}
 
-	return md->ret;
+	FreeMem(buf, MAX_BLOCKSIZE);
+	return mounted;
 }
 
-static LONG ScanMBR(struct MountData *md)
+// Non-RDB media, classified from one read of block 0: GPT (gated by its
+// protective/hybrid MBR entry, so a stale GPT header on a since-repartitioned
+// disk can't override the current table), then a filesystem straight at
+// block 0 (superfloppy — its VBR ends in 0x55AA too, so it must be checked
+// before the MBR signature), then MBR.
+// Returns -1 if nothing was recognized, else partitions mounted.
+static LONG ScanLegacy(struct MountData *md)
 {
+	struct ExecBase *SysBase = md->SysBase;
+	UBYTE *buf = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
+	if (!buf)
+		return -1;
 	LONG ret = -1;
-	if (readblock(md->buf, 1, 0xffffffff, md)) {
-		struct gpt *gpt = (struct gpt *)md->buf;
-		if (!memcmp(gpt->signature, "EFI PART", 8)) {
-			dbg("GPT found\n");
-			ret = ParseGPT(md->buf, md);
+
+	if (readblock(buf, 0, 0xffffffff, md)) {
+		struct mbr *mbr = (struct mbr *)buf;
+		BOOL hasMBRSig = mbr->sig[0] == 0x55 && mbr->sig[1] == 0xaa;
+
+		if (hasMBRSig && HasProtectiveEntry(mbr)) {
+			// The GPT header gets its own sector so block 0 stays intact for the
+			// MBR fallback if the header is invalid. A valid header commits us to
+			// GPT — ParseGPT's result stands even when it mounts nothing.
+			UBYTE *hdr = AllocMem(MAX_BLOCKSIZE, MEMF_PUBLIC);
+			BOOL gptValid = FALSE;
+			if (hdr) {
+				if (readblock(hdr, 1, 0xffffffff, md) &&
+				    ValidGPTHeader((struct gpt *)hdr, md)) {
+					dbg("GPT found\n");
+					gptValid = TRUE;
+					ret = ParseGPT(hdr, md);
+				}
+				FreeMem(hdr, MAX_BLOCKSIZE);
+			}
+			if (gptValid)
+				goto done;
+			// Fall through: a hybrid MBR may still carry mountable entries; a
+			// pure protective one fails SaneMBR or mounts nothing in ParseMBR.
+			printf("GPT protective entry but no valid GPT header at block 1\n");
 		}
-	}
-	if (ret == -1 && readblock(md->buf, 0, 0xffffffff, md)) {
-		struct mbr *mbr = (struct mbr *)md->buf;
-		if (mbr->sig[0]==0x55 && mbr->sig[1]==0xaa) {
+
+		if (DetectVBR(buf, md->blocksize) != VBR_NONE) {
+			if (md->totalsectors) {
+				dbg("Superfloppy (no partition table)\n");
+				ret = register_legacy(md, 0, 0, 0, md->totalsectors) > 0 ? 1 : 0;
+			}
+		} else if (hasMBRSig && SaneMBR(mbr, md->totalsectors)) {
 			dbg("MBR found\n");
-			ret = ParseMBR(md->buf, md);
+			ret = ParseMBR(buf, md);
 		}
 	}
 
+done:
+	FreeMem(buf, MAX_BLOCKSIZE);
 	return ret;
 }
-#endif
 
 // Probe one unit: open it, read geometry, scan its partition table(s), close.
 // Returns the per-unit result (-1 error/no RDB, 0 none, >0 partitions mounted).
@@ -1544,138 +1811,185 @@ static LONG ProbeUnit(struct MountData *md, struct MountStruct *ms, ULONG unitNu
 	LONG ret = -1;
 	UBYTE err;
 
-	dbg("OpenDevice('%s', %"PRId32", %p, 0)\n", ms->deviceName, unitNum, request);
+	dbg("OpenDevice('%s', %"PRId32", 0x%08lx, 0)\n", ms->deviceName, unitNum, (ULONG)request);
 	err = OpenDevice(ms->deviceName, unitNum, (struct IORequest*)request, 0);
 	if (err != 0) {
 		dbg("OpenDevice(%s,%"PRId32") failed: %"PRId32"\n", ms->deviceName, unitNum, (BYTE)err);
 		return -1;
 	}
 	if (GetGeometry(request, &geom) == 0) {
-		md->request    = request;
-		md->devicename = ms->deviceName;
-		md->blocksize  = geom.dg_SectorSize;
-		md->unitnum    = unitNum;
+		if (geom.dg_SectorSize < 256 || geom.dg_SectorSize > MAX_BLOCKSIZE) {
+			printf("Unsupported sector size %lu.\n", geom.dg_SectorSize);
+			goto out;
+		}
+		md->request      = request;
+		md->devicename   = ms->deviceName;
+		md->blocksize    = geom.dg_SectorSize;
+		md->totalsectors = geom.dg_TotalSectors;
+		md->unitnum      = unitNum;
+		md->legacyMounted = FALSE;
 		switch (geom.dg_DeviceType & SID_TYPE) {
 		case DG_CDROM:
 		case DG_WORM:
 		case DG_OPTICAL_DISK:
-			if (ms->cdBoot)
+			if (!(md->flags & MSF_NO_CD))
 				ret = ScanCDROM(md);
 			else
-				printf("CDROM boot disabled.\n");
+				printf("CDROM mounting disabled.\n");
 			break;
 		case DG_DIRECT_ACCESS:
-			ret = ScanRDSK(md);
-#ifdef DISKLABELS
-			if (ret == -1)
-				ret = ScanMBR(md);
-#endif
+			if (!(md->flags & MSF_NO_RDB))
+				ret = ScanRDSK(md);
+			if (ret == -1 && !(md->flags & MSF_NO_LEGACY))
+				ret = ScanLegacy(md);
 			break;
 		default:
-			printf("Don't know how to boot from device type %d.\n", geom.dg_DeviceType & SID_TYPE);
+			printf("Don't know how to boot from device type %ld.\n", (LONG)(geom.dg_DeviceType & SID_TYPE));
 			break;
 		}
 	}
-	// Disable motor after probing
-	md->request->iotd_Req.io_Command = TD_MOTOR;
-	md->request->iotd_Req.io_Length  = 0;
-	DoIO((struct IORequest*)md->request);
+out:
+	// Disable motor after probing (md->request is unset if geometry failed)
+	request->iotd_Req.io_Command = TD_MOTOR;
+	request->iotd_Req.io_Length  = 0;
+	DoIO((struct IORequest*)request);
 	CloseDevice((struct IORequest*)request);
 	return ret;
 }
 
-// Return values:
-// If single unit number:
-// -1 = No RDB found, device failed to open, disk error or RDB block checksum error.
-// 0 = RDB found but no partitions found, disk error or mount failure.
-// >0: Number of partitions mounted.
-// If unit number array:
-// Unit number is replaced with error code:
-// Error codes are same as above except:
-// -2 = Skipped, previous unit had RDBFF_LAST set.
+// Full SCSI-style scan: every target 0-7 (skipping the host ID), optionally each
+// target's LUNs, honoring RDBFF_LASTLUN / RDBFF_LAST. Accumulates the mounted
+// count into *total and sets *recognized if any unit held recognizable media.
+static void ScanAllUnits(struct MountData *md, struct MountStruct *ms,
+                         struct IOExtTD *request, LONG *total, BOOL *recognized)
+{
+	for (ULONG target = 0; target < 8; target++) {
+		if (target == ms->hostId)   // skip the host controller ID
+			continue;
+		ULONG lun = 0;
+		for (;;) {
+			ULONG unitNum;
+			if (target > 7 || lun > 7)
+				unitNum = lun * 10 * 1000 + target * 10 + HD_WIDESCSI;  // Phase V wide SCSI
+			else
+				unitNum = target + lun * 10;                            // traditional scheme
+			LONG r = ProbeUnit(md, ms, unitNum, request);
+			if (r >= 0) {
+				*recognized = TRUE;
+				*total += r;
+			}
+			if (!(ms->luns && lun++ < 8 && !md->wasLastLun))
+				break;
+		}
+		if (md->wasLastDev && !ms->ignoreLast) {
+			dbg("RDBFF_LAST exit\n");
+			break;
+		}
+	}
+}
+
+// Explicit unit(s): a single unit number (< 0x100), else a pointer to a
+// { count, unit0, unit1, ... } array. Lets a caller mount known units (e.g. a
+// hotplug driver) instead of scanning. For an array, each entry is overwritten
+// with that unit's result (-2 = skipped after a prior RDBFF_LAST).
+static void ScanUnitList(struct MountData *md, struct MountStruct *ms,
+                         struct IOExtTD *request, LONG *total, BOOL *recognized)
+{
+	ULONG single[2];
+	ULONG *list;
+	if ((ULONG)ms->unitNum < 0x100) {
+		single[0] = 1;
+		single[1] = (ULONG)ms->unitNum;
+		list = single;
+	} else {
+		list = ms->unitNum;
+	}
+	ULONG n = list[0];
+	BOOL skipRest = FALSE;
+	for (ULONG i = 1; i <= n; i++) {
+		LONG r = -2;
+		if (!skipRest) {
+			r = ProbeUnit(md, ms, list[i], request);
+			if (r >= 0) {
+				*recognized = TRUE;
+				*total += r;
+			}
+			if (md->wasLastDev && !ms->ignoreLast) {
+				dbg("RDBFF_LAST exit\n");
+				skipRest = TRUE;
+			}
+		}
+		if (list != single)
+			list[i] = r;
+	}
+}
+
+// Return value: total number of partitions mounted across all units (>0);
+// 0 if at least one unit carried a recognized medium but nothing was mounted;
+// -1 if no partition table / filesystem was recognized on any unit.
+// If a unit number array was passed, each unit number is additionally replaced
+// with that unit's result: -1 = nothing recognized (or device failed to open),
+// 0 = recognized but nothing mounted, >0 = partitions mounted,
+// -2 = skipped because a previous unit had RDBFF_LAST set.
 LONG MountDrive(struct MountStruct *ms)
 {
-	LONG ret = -1;
+	struct ExecBase *SysBase = ms->SysBase;
+	struct ExpansionBase *ExpansionBase = NULL;
+	struct MountData *md = NULL;
 	struct MsgPort *port = NULL;
 	struct IOExtTD *request = NULL;
-	struct ExpansionBase *ExpansionBase;
-	struct ExecBase *SysBase = ms->SysBase;
+	LONG total = 0;
+	BOOL recognized = FALSE;
+
 	dbg("Starting..\n");
+
 	ExpansionBase = (struct ExpansionBase*)OpenLibrary("expansion.library", 34);
-	if (ExpansionBase) {
-		struct MountData *md = AllocMem(sizeof(struct MountData), MEMF_CLEAR | MEMF_PUBLIC);
-		if (md) {
-			md->DOSBase = (struct DosLibrary*)OpenLibrary("dos.library", 34);
-			md->SysBase = SysBase;
-			md->ExpansionBase = ExpansionBase;
-			dbg("SysBase=0x%08lx ExpansionBase=0x%08lx DosBase=0x%08lx\n", (ULONG)md->SysBase, (ULONG)md->ExpansionBase, (ULONG)md->DOSBase);
-			md->configDev = ms->configDev;
-			md->creator = ms->creatorName;
-			md->slowSpinup = ms->slowSpinup;
-			port = W_CreateMsgPort(SysBase);
-			if(port) {
-				request = (struct IOExtTD*)W_CreateIORequest(port, sizeof(struct IOExtTD), SysBase);
-				if(request) {
-					if (ms->unitNum == NULL) {
-						// Legacy full SCSI scan: targets 0-7 (x LUNs).
-						ULONG target;
-						ULONG lun = 0;
-						for (target = 0; target < 8; target++, lun = 0) {
-							// Skip the host controller ID
-							if (target == ms->hostId)
-								continue;
-							ULONG unitNum;
-next_lun:
-							if (target > 7 || lun > 7) {
-								// Phase V wide SCSI scheme for IDs/LUNs > 7
-								unitNum = lun * 10 * 1000 + target * 10 + HD_WIDESCSI;
-							} else {
-								// Traditional scheme for IDs/LUNs <= 7
-								unitNum = target + lun * 10;
-							}
-							ret = ProbeUnit(md, ms, unitNum, request);
-							if (ms->luns && (lun++ < 8) && (!md->wasLastLun)) {
-								goto next_lun;
-							}
-							if (md->wasLastDev && !ms->ignoreLast) {
-								dbg("RDBFF_LAST exit\n");
-								break;
-							}
-						}
-					} else {
-						// Explicit unit(s): single value (<0x100), else pointer to
-						// { count, unit0, unit1, ... }. Lets a caller mount one known
-						// unit (e.g. a hotplug driver) instead of scanning 0-7.
-						ULONG single[2];
-						ULONG *list;
-						ULONG i, n;
-						if ((ULONG)ms->unitNum < 0x100) {
-							single[0] = 1;
-							single[1] = (ULONG)ms->unitNum;
-							list = single;
-						} else {
-							list = ms->unitNum;
-						}
-						n = list[0];
-						for (i = 1; i <= n; i++) {
-							ret = ProbeUnit(md, ms, list[i], request);
-							if (md->wasLastDev && !ms->ignoreLast) {
-								dbg("RDBFF_LAST exit\n");
-								break;
-							}
-						}
-					}
-					W_DeleteIORequest(request, SysBase);
-				}
-				W_DeleteMsgPort(port, SysBase);
-			}
-			if (md->DOSBase) {
-				CloseLibrary(&md->DOSBase->dl_lib);
-			}
-			FreeMem(md, sizeof(struct MountData));
-		}
-		CloseLibrary(&ExpansionBase->LibNode);
+	if (!ExpansionBase)
+		goto cleanup;
+
+	md = AllocMem(sizeof(struct MountData), MEMF_CLEAR | MEMF_PUBLIC);
+	if (!md)
+		goto cleanup;
+
+	md->DOSBase = (struct DosLibrary*)OpenLibrary("dos.library", 34);
+	md->SysBase = SysBase;
+	md->ExpansionBase = ExpansionBase;
+	dbg("SysBase=0x%08lx ExpansionBase=0x%08lx DosBase=0x%08lx\n", (ULONG)md->SysBase, (ULONG)md->ExpansionBase, (ULONG)md->DOSBase);
+	md->configDev = ms->configDev;
+	md->creator = ms->creatorName;
+	md->slowSpinup = ms->slowSpinup;
+	md->flags = ms->flags;
+	md->fatFS = ms->fatFS;
+	md->ntfsFS = ms->ntfsFS;
+	md->cdFS = ms->cdFS;
+
+	port = W_CreateMsgPort(SysBase);
+	if (!port)
+		goto cleanup;
+
+	request = (struct IOExtTD*)W_CreateIORequest(port, sizeof(struct IOExtTD), SysBase);
+	if (!request)
+		goto cleanup;
+
+	if (ms->unitNum == NULL)
+		ScanAllUnits(md, ms, request, &total, &recognized);
+	else
+		ScanUnitList(md, ms, request, &total, &recognized);
+
+cleanup:
+	if (request)
+		W_DeleteIORequest(request, SysBase);
+	if (port)
+		W_DeleteMsgPort(port, SysBase);
+	if (md) {
+		if (md->DOSBase)
+			CloseLibrary(&md->DOSBase->dl_lib);
+		FreeMem(md, sizeof(struct MountData));
 	}
+	if (ExpansionBase)
+		CloseLibrary(&ExpansionBase->LibNode);
+
+	LONG ret = total > 0 ? total : (recognized ? 0 : -1);
 	dbg("Exit code %"PRId32"\n", ret);
 	return ret;
 }
