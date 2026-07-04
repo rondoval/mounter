@@ -1,7 +1,9 @@
 /*
- * legacy.h — MBR/GPT on-disk partition structures for the mounter's DISKLABELS path.
+ * legacy.h — MBR/GPT on-disk partition structures for the mounter's legacy path.
  *
- * mounter.c (behind -DDISKLABELS) #includes this. The struct/GUID definitions are
+ * mounter.c #includes this unconditionally (the old -DDISKLABELS compile gate is
+ * gone; the MBR/GPT/superfloppy scan is a runtime decision via MSF_NO_LEGACY).
+ * The struct/GUID definitions are
  * verbatim from the a4091-software repo
  *   https://github.com/A4091/a4091-software/blob/HEAD/legacy.h
  *   (Copyright 2022-2023 Stefan Reinauer & Chris Hooper, BSD-2-Clause),

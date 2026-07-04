@@ -1,47 +1,69 @@
 # Mounter: AmigaOS Generic Mounter
 
-Generic autoboot / automount RDB parser and mounter.
+Generic autoboot / automount partition parser and mounter: RDB, MBR, GPT,
+superfloppy and data CDs.
 
-This is the mounter code from a4091.device.
+This is the mounter code from `a4091.device` (`poseidon-fixes` fork; see
+CHANGELOG.md for the differences against upstream).
 
 ## 1. Introduction
 
 This Mounter software is a generic, autoboot/automount Rigid Disk Block (RDB)
 parser and mounter for AmigaOS. Originally developed by Toni Wilen and extended
-by Stefan Reinauer and Matt Harlum. It is used by the `a4091.device` and
-'lide.device' drivers. This software is engineered to be a robust and highly
-compatible solution for device drivers that need to mount partitions and
-filesystems at boot time.
+by Stefan Reinauer and Matt Harlum, it is used by the `a4091.device` and
+`lide.device` drivers; this fork additionally drives the Poseidon USB stack's
+`massstorage.class` (hotplugged media). It is engineered to be a robust and
+highly compatible solution for device drivers that need to mount partitions
+and filesystems — at boot time or at hotplug time.
 
 It is designed to be highly portable, 68000-compatible, and capable of
 operating in diverse environments, from a Kickstart 1.3 Boot ROM to a modern
-AmigaOS system. Its primary function is to scan for storage devices, interpret
-their partition maps (RDB, MBR, GPT), load the necessary filesystems, and make
-them available to the operating system.
+AmigaOS system. Its primary function is to scan storage devices, interpret
+their partition maps (RDB, MBR, GPT, or none), load or locate the necessary
+filesystems, and make the partitions available to the operating system.
 
 ---
 
 ## 2. Core Features
-
-The Mounter provides a comprehensive set of features making it a versatile
-solution:
 
 * **Broad OS Compatibility**: Full support for Kickstart 1.3 and newer,
   including its specific autoboot mechanisms.
 * **CPU Compatibility**: Compatible with the Motorola 68000 processor, ensuring
   it runs on all classic Amiga models.
 * **Autoboot Capability**: Can participate in the Amiga's autoconfig boot
-  process to mount bootable partitions
+  process to mount bootable partitions.
 * **Full Automount Support**: Automatically finds and mounts all valid
   partitions it discovers.
-* **Rich Filesystem Support**:
-    * **RDB**: Full support for the Amiga Rigid Disk Block (RDB) standard.
-    * **MBR & GPT**: Support for PC-style Master Boot Record and GUID Partition
-      Table layouts, enhancing cross-platform compatibility.
-    * **CD-ROM**: Capable of booting from CD-ROMs following the ISO 9660
-      standard with Amiga-specific "Amiga Boot" or "CDTV" system identifiers.
+* **Rich Partition/Filesystem Support**:
+    * **RDB**: Full support for the Amiga Rigid Disk Block standard, including
+      loading and relocating filesystems embedded on disk (FSHD/LSEG).
+    * **MBR & GPT**: PC-style Master Boot Records (including 0x05/0x0F/0x85
+      extended-partition chains) and GUID Partition Tables (validated header,
+      gated by the protective MBR entry).
+    * **Superfloppy**: a filesystem at block 0 with no partition table mounts
+      as a whole-disk device.
+    * **Content sniffing**: each legacy partition's boot sector is inspected
+      (`DetectVBR`) — FAT, NTFS and exFAT are told apart; the MBR type byte /
+      GPT type GUID is treated only as a hint. Unsupported content is skipped
+      instead of mounted wrongly.
+    * **CD-ROM**: ISO 9660 data CDs mount as read-only volumes; Amiga-bootable
+      CDs ("AMIGA BOOT" / "CDTV" system ID) get boot priority; RDB-formatted
+      CDs are also supported.
+* **Filesystem recipes**: the caller controls, per filesystem family
+  (FAT/NTFS/CD), the dostype, an optional handler file loaded by DOS on first
+  access (no FileSystem.resource entry needed), the preferred DOS device name,
+  `de_Control`, buffers, MaxTransfer and stack size. See `struct MountFS`.
+* **Explicit unit mounting**: besides the classic full SCSI scan, a caller can
+  mount a single unit or a list of units (hotplug drivers), with per-unit
+  results reported back.
+* **Collision-safe device naming**: preferred names get a trailing digit
+  ensured ("UMSD" → "UMSD0") and bumped past collisions ("UMSD1" … "UMSD10"),
+  checked against both the pre-boot MountList and the live DOS lists.
 * **LUN Support**: Can scan for and mount devices on multiple Logical Unit
   Numbers (LUNs).
+* **Hardened against corrupt media**: untrusted on-disk fields are clamped,
+  block chains are cycle-capped, and the hunk relocator is overflow-checked
+  (see 4.5).
 
 ---
 
@@ -58,14 +80,26 @@ identify and mount partitions.
   passed to the `MountDrive` function. It defines the parameters for a mounting
   session.
     * `deviceName`: The name of the device driver to use (e.g., `scsi.device`).
-    * `unitNum`: A pointer to an array of unit numbers to scan.
+    * `unitNum`: NULL = classic scan of SCSI targets 0–7 (plus LUNs if
+      enabled); a value < 0x100 = that single unit; otherwise a pointer to a
+      `{count, unit0, unit1, ...}` array. Array entries are overwritten with
+      each unit's result.
     * `creatorName`: A string to identify the creator of the filesystem entries.
     * `configDev`: A pointer to the `ConfigDev` structure for an autoconfig
       board, essential for autobooting.
-    * `luns`, `slowSpinup`, `cdBoot`, `ignoreLast`: Boolean flags to control
-      behavior like LUN scanning, spin-up delays, CD booting, and handling of
-      the RDB `RDBFF_LAST` flag.
+    * `luns`, `slowSpinup`, `ignoreLast`: Boolean flags to control behavior
+      like LUN scanning, spin-up delays, and handling of the RDB
+      `RDBFF_LAST` flag.
+    * `flags`: `MSF_*` flags gating the RDB / MBR-GPT-superfloppy / CD scans
+      and boot-node creation.
+    * `fatFS`, `ntfsFS`, `cdFS`: filesystem recipes (see below); NULL keeps
+      the classic behavior.
     * `SysBase`: A pointer to the Exec library base.
+
+* **`struct MountFS` (`mounter.h`)**: A filesystem recipe for non-RDB media:
+  dostype, optional handler file, preferred DOS device name, `de_Control`
+  string, buffers, MaxTransfer and handler stack size. All strings are owned
+  by the caller for the duration of `MountDrive()`.
 
 * **`struct MountData` (`mounter.c`)**: An internal state-management structure
   used during the `MountDrive` execution. It holds pointers to opened
@@ -82,54 +116,49 @@ The logical flow of the `MountDrive` function is as follows:
     * Create a message port and an I/O request for communicating with the
       device driver.
 
-2.  **Device Scanning Loop**:
-    * Iterate through the specified SCSI targets (and LUNs, if enabled).
-    * For each unit, attempt to `OpenDevice()`.
+2.  **Unit Selection**:
+    * `unitNum == NULL`: iterate the SCSI targets 0–7 (and LUNs, if enabled),
+      honoring `RDBFF_LAST`/`RDBFF_LASTLUN` (`ScanAllUnits`).
+    * Otherwise: probe exactly the given unit(s) (`ScanUnitList`), writing each
+      unit's result back into the caller's array.
+    * Each unit is probed by `ProbeUnit()`: `OpenDevice()`, geometry, scan,
+      motor off, `CloseDevice()`.
 
-3.  **Partition Scheme Identification**:
-    * If a device is opened successfully, get its geometry using
-      `TD_GETGEOMETRY`.
-    * Based on the device type (`DG_DIRECT_ACCESS`, `DG_CDROM`), determine
-      the scanning strategy.
-    * **For Direct Access Devices**:
-        1.  Attempt to find an RDB by scanning the first `RDB_LOCATION_LIMIT`
-	    blocks (`ScanRDSK`).
-        2.  If no RDB is found, check for a GUID Partition Table (GPT) at
-	    block 1 (`ScanMBR`).
-        3.  If no GPT is found, check for a Master Boot Record (MBR) at block
-	    0 (`ScanMBR`).
-    * **For CD-ROM Devices**:
-        1.  Check if the unit is ready and contains a data CD (`ScanCDROM`).
-        2.  Check the Primary Volume Descriptor (PVD) for "AMIGA BOOT" or
-	    "CDTV" identifiers (`CheckPVD`).
-        3.  If not an Amiga bootable CD, fall back to scanning for an RDB
-	    (`ScanRDSK`).
+3.  **Partition Scheme Identification** (per unit):
+    * Get the geometry via `TD_GETGEOMETRY`; sector sizes 256–4096 are
+      accepted.
+    * **Direct-access devices**: try RDB first — scan the first
+      `RDB_LOCATION_LIMIT` blocks (`ScanRDSK`, unless `MSF_NO_RDB`). If no RDB,
+      classify block 0 (`ScanLegacy`, unless `MSF_NO_LEGACY`): a GPT (gated by
+      its protective MBR entry and a validated header at block 1), else a
+      filesystem VBR at block 0 (superfloppy), else a sane MBR.
+    * **CD/WORM/optical devices** (unless `MSF_NO_CD`): check unit ready and
+      that track 1 is a data track, then the ISO PVD (`CheckPVD`) for
+      "AMIGA BOOT"/"CDTV" (boot priority). No PVD → RDB-CD fallback.
 
 4.  **Partition Processing**:
-    * Call the appropriate parsing function (`ParseRDSK`, `ParseGPT`,
-      `ParseMBR`, `ScanCDROM`).
-    * These functions iterate through partition entries.
+    * The appropriate parser iterates the entries: `ParseRDSK`/`ParsePART`
+      (RDB), `ParseMBR`/`parse_extended` (MBR/EBR chains), `ParseGPT`,
+      or the whole-medium CD/superfloppy mount.
 
 5.  **Filesystem Loading & Mounting**:
-    * For each valid partition, `ParsePART` is called.
-    * It reads the partition's `DosEnvec` to determine the required filesystem
-      `DosType`.
-    * It calls `ParseFSHD` to find or load the required filesystem. `ParseFSHD`
-      searches `FileSystem.resource` and, if not found or if the version is
-      older, loads the filesystem from the disk's FileSystem Header Blocks
-      (`FSHD`).
-    * The loaded filesystem code is relocated in memory using the `fsrelocate`
-      function.
-    * A `DeviceNode` is created using `MakeDosNode()` and populated with the
-      partition's parameters.
-    * The `DeviceNode` is added to the system's mount list using `AddDosNode()`
-      or `AddBootNode()` (for bootable partitions).
+    * **RDB path**: `ParsePART` reads the partition's `DosEnvec`, then
+      `ParseFSHD` finds or loads the filesystem — `FileSystem.resource` is
+      searched and, if absent or older, the filesystem is loaded from the
+      disk's FSHD blocks and relocated (`fsrelocate`).
+    * **Legacy/CD paths**: `mount_recipe()` builds the `DeviceNode` from the
+      recipe — a registered dostype resolves via `FileSystem.resource`,
+      otherwise the recipe's handler file is attached (`dn_Handler`,
+      `dn_GlobalVec = -1`) for DOS to load on first access. Partitions whose
+      recipe resolves to neither are skipped before any node is created.
+    * The `DeviceNode` is created with `MakeDosNode()` and added via
+      `AddBootNode()` (bootable, pre-DOS) or `AddDosNode()` — the same rule on
+      every path; `MSF_NO_BOOT` forces non-bootable.
 
-6.  **Cleanup**:
-    * The device is closed.
-    * The loop continues to the next unit/target.
-    * After the loop, all allocated resources (I/O requests, ports, library
-      bases) are freed.
+6.  **Cleanup & Result**:
+    * All allocated resources (I/O requests, ports, library bases) are freed.
+    * Return value: total partitions mounted (> 0), 0 if media was recognized
+      but nothing mounted, -1 if nothing was recognized on any unit.
 
 ---
 
@@ -159,7 +188,8 @@ The mounter interacts carefully with the central `FileSystem.resource`.
 * After a filesystem is successfully loaded and relocated by `fsrelocate`,
   `FSHDAdd` adds the new `FileSysEntry` to `FileSystem.resource`,
   making it available for all subsequent mounting operations
-  system-wide.
+  system-wide. If loading failed, the entry is freed and the mounter falls
+  back to any already-registered filesystem for that dostype.
 * If `FileSystem.resource` does not exist (common on KS 1.3), it is created.
 
 ### 4.3. Kickstart 1.3 Compatibility
@@ -184,9 +214,22 @@ autoconfig hardware board, signaling to the OS that this is a candidate for
 booting. If no `configDev` is provided, the mounter can create a "fake" one to
 enable autobooting from devices that are not on a standard autoconfig chain.
 
+### 4.5. Untrusted-Media Hardening
+
+Everything read from the medium is treated as untrusted (USB sticks arrive
+with corrupt or hostile metadata):
+* The RDB environment vector's `de_TableSize` and the partition name's length
+  byte are clamped before use.
+* The PART and FSHD block chains are cycle-capped, so a corrupt `pb_Next` /
+  `fhb_Next` loop cannot hang the caller.
+* The hunk relocator bounds hunk counts, per-hunk sizes and relocation offsets
+  against 32-bit overflow.
+* Block checksums bound their summed-longs count to the sector size; MBR/GPT
+  tables must pass sanity/CRC checks before being believed.
+
 ---
 
-## 5. Dependencies
+## 5. Dependencies & Diagnostics
 
 The Mounter relies on the following standard AmigaOS libraries:
 
@@ -197,11 +240,19 @@ The Mounter relies on the following standard AmigaOS libraries:
 * `dos.library` (v34+): For creating `DeviceNode` structures and adding them
   to the DOS list.
 
+Diagnostics: build with `-DMOUNTER_LOG` and provide
+`void mounter_log(const char *fmt, ...)` to receive all mounter output. Format
+strings use `%l`-sized conversions only, so a RawDoFmt-based sink formats them
+correctly. Without `MOUNTER_LOG`, all output compiles away.
+
 ---
 
 ## 6. License
 
 Copyright 2021-2022 Toni Wilen
+
+The MBR/GPT on-disk structures (`legacy.h`) are Copyright 2022-2023
+Stefan Reinauer & Chris Hooper (BSD-2-Clause, from a4091-software).
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:

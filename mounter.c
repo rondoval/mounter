@@ -88,6 +88,15 @@ void mounter_log(const char *fmt, ...);
 #define MAX_BLOCKSIZE 4096
 #define LSEG_DATASIZE (512 / 4 - 5)
 
+// Hardening caps against corrupt/hostile on-disk metadata.
+// The RDB PART and FSHD chains are singly linked by block number; a cyclic link
+// would otherwise loop forever (the PART loop re-mounting each lap). The reloc
+// caps keep the (size + 2) * 4 byte allocations below the 32-bit wrap point.
+#define MAX_RDB_PARTITIONS 128          // realistic ceiling; > any sane RDB
+#define MAX_RDB_FILESYS    64           // FSHD chain length
+#define MAX_RELOC_HUNKS    4096         // hunks in one loaded filesystem
+#define MAX_HUNK_LONGS     (16UL * 1024 * 1024 / sizeof(ULONG))  // 16 MB per hunk
+
 #if NO_CONFIGDEV
 extern UBYTE entrypoint, entrypoint_end;
 extern UBYTE bootblock, bootblock_end;
@@ -468,6 +477,12 @@ static APTR fsrelocate(struct MountData *md)
 		return NULL;
 	}
 	totalHunks = lastHunk - firstHunk + 1;
+	// firstHunk/lastHunk are untrusted; a huge span would overflow the AllocMem
+	// size below (and every later hunkCnt loop).
+	if (totalHunks > MAX_RELOC_HUNKS) {
+		dbg("Too many hunks (%ld)\n", totalHunks);
+		return NULL;
+	}
 	dbg("first hunk %ld, last hunk %ld\n", firstHunk, lastHunk);
 	relocHunks = AllocMem(totalHunks * sizeof(struct RelocHunk), MEMF_CLEAR);
 	if (!relocHunks) {
@@ -492,6 +507,12 @@ static APTR fsrelocate(struct MountData *md)
 			memoryFlags |= MEMF_CHIP;
 		}
 		hunkHeadSize &= ~(HUNKF_CHIP | HUNKF_FAST);
+		// Cap the per-hunk size so (hunkHeadSize + 2) * 4 cannot wrap the 32-bit
+		// allocation (a masked size can still be up to 0x3FFFFFFF longs).
+		if (hunkHeadSize > MAX_HUNK_LONGS) {
+			dbg("Hunk too large (%lu longs)\n", hunkHeadSize);
+			goto end;
+		}
 		rh->hunkSize = hunkHeadSize;
 		rh->hunkData = AllocMem((hunkHeadSize + 2) * sizeof(ULONG), memoryFlags | MEMF_CLEAR);
 		if (!rh->hunkData) {
@@ -580,7 +601,10 @@ static APTR fsrelocate(struct MountData *md)
 								goto end;
 							}
 						}
-						if (relocOffset > (rh->hunkSize - 1) * sizeof(ULONG)) {
+						// Guard hunkSize == 0: (0 - 1) * 4 would wrap to a huge
+						// bound and let any offset through into a zero-size hunk.
+						if (rh->hunkSize == 0 ||
+						    relocOffset > (rh->hunkSize - 1) * sizeof(ULONG)) {
 							goto end;
 						}
 						UBYTE *hData = (UBYTE*)rh->hunkData + relocOffset;
@@ -739,8 +763,11 @@ static struct FileSysEntry *FSHDProcess(struct FileSysHeaderBlock *fshb, ULONG d
 	return result_fse;
 }
 
-// Add new FileSysEntry to FileSystem.resource or free it if filesystem load failed.
-static void FSHDAdd(struct FileSysEntry *fse, struct MountData *md)
+// Add new FileSysEntry to FileSystem.resource, or free it if the filesystem
+// load failed (fse_SegList == 0) or the resource can't be reached. Returns TRUE
+// if the entry survived (added and still valid to read), FALSE if it was freed —
+// the caller must drop its pointer in that case, or it dangles.
+static BOOL FSHDAdd(struct FileSysEntry *fse, struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
 	if (fse->fse_SegList) {
@@ -748,15 +775,17 @@ static void FSHDAdd(struct FileSysEntry *fse, struct MountData *md)
 		struct FileSysResource *fsr = OpenResource(FSRNAME);
 		if (fsr) {
 			AddHead(&fsr->fsr_FileSysEntries, &fse->fse_Node);
-			dbg("FileSysEntry 0x%08lx added to FileSystem.resource, dostype %08"PRIx32"\n", (ULONG)fse, fse->fse_DosType);
-			fse = NULL;
+			dbg("FileSysEntry 0x%08lx added to FileSystem.resource, dostype %08lx\n", (ULONG)fse, fse->fse_DosType);
+			Permit();
+			return TRUE;
 		}
 		Permit();
 	}
-	if (fse) {
-		dbg("FileSysEntry 0x%08lx freed, dostype %08"PRIx32"\n", (ULONG)fse, fse->fse_DosType);
-		FreeMem(fse, sizeof(struct FileSysEntry));
-	}
+	// Match the allocation in FSHDProcess: struct + creator string + NUL.
+	const UBYTE *creator = md->creator ? md->creator : md->zero;
+	dbg("FileSysEntry 0x%08lx freed, dostype %08lx\n", (ULONG)fse, fse->fse_DosType);
+	FreeMem(fse, sizeof(struct FileSysEntry) + strlen((const char *)creator) + 1);
+	return FALSE;
 }
 
 // Parse FileSystem Header Blocks, load and relocate filesystem if needed.
@@ -771,7 +800,8 @@ static struct FileSysEntry *ParseFSHD(ULONG block, ULONG dostype, struct MountDa
 
 	if (buf && segbuf) {
 		struct FileSysHeaderBlock *fshb = (struct FileSysHeaderBlock*)buf;
-		for (;;) {
+		// cap the fhb_Next chain so a cyclic/corrupt RDB can't spin.
+		for (int i = 0; i < MAX_RDB_FILESYS; i++) {
 			if (block == 0xffffffff) {
 				break;
 			}
@@ -788,8 +818,11 @@ static struct FileSysEntry *ParseFSHD(ULONG block, ULONG dostype, struct MountDa
 					md->lseglongs = 0;
 					APTR seg = fsrelocate(md);
 					fse->fse_SegList = MKBADDR(seg);
-					// Add to FileSystem.resource if succeeded, delete entry if failure.
-					FSHDAdd(fse, md);
+					// Add to FileSystem.resource if succeeded, delete entry if
+					// failure. On failure FSHDAdd frees fse, so drop our pointer
+					// (the caller must not read a dangling FileSysEntry).
+					if (!FSHDAdd(fse, md))
+						fse = NULL;
 				}
 				break;
 			}
@@ -1079,13 +1112,21 @@ static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct Mount
 	if (!readblock(buf, block, IDNAME_PARTITION, md)) {
 		return nextpartblock;
 	}
-	dbg("PART found, block %"PRIu32"\n", block);
+	dbg("PART found, block %lu\n", block);
 	nextpartblock = part->pb_Next;
 	if (!(part->pb_Flags & PBFF_NOMOUNT)) {
 		struct ParameterPacket *pp = AllocMem(sizeof(struct ParameterPacket), MEMF_PUBLIC | MEMF_CLEAR);
 		if (pp) {
 			UBYTE len;
-			copymem(&pp->de, &part->pb_Environment, (part->pb_Environment[0] + 1) * sizeof(ULONG));
+			// pb_Environment[0] (de_TableSize) is untrusted disk data. Clamp it to
+			// what pp->de (a struct DosEnvec) holds before copying, or the copy
+			// overruns the ParameterPacket — and clamp de_TableSize itself so
+			// MakeDosNode, which reads (de_TableSize + 1) longs, stays in bounds.
+			ULONG tablesize = part->pb_Environment[0];
+			if (tablesize > sizeof(struct DosEnvec) / sizeof(ULONG) - 1)
+				tablesize = sizeof(struct DosEnvec) / sizeof(ULONG) - 1;
+			copymem(&pp->de, &part->pb_Environment, (tablesize + 1) * sizeof(ULONG));
+			pp->de.de_TableSize = tablesize;
 			struct FileSysEntry *fse = ParseFSHD(filesysblock, pp->de.de_DosType, md);
 			pp->execname = md->devicename;
 			pp->unitnum = md->unitnum;
@@ -1130,7 +1171,10 @@ static LONG ParseRDSK(UBYTE *buf, struct MountData *md)
 	ULONG filesysblock = rdb->rdb_FileSysHeaderList;
 	ULONG flags = rdb->rdb_Flags;
 	LONG mounted = 0;
-	for (;;) {
+	// a cyclic pb_Next on a corrupt RDB would otherwise re-mount
+	// the same partitions forever. ParsePART also returns 0xffffffff on read
+	// failure, which ends the walk early.
+	for (int i = 0; i < MAX_RDB_PARTITIONS; i++) {
 		if (partblock == 0xffffffff) {
 			break;
 		}
