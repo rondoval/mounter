@@ -32,6 +32,7 @@ struct MountFS
 #define MSF_NO_CD              0x0004  // skip CD mounting (ISO9660 and RDB-CD)
 #define MSF_LEGACY_FIRST_ONLY  0x0008  // mount only the first MBR/GPT/superfloppy filesystem per unit
 #define MSF_NO_BOOT            0x0010  // never create pre-DOS boot nodes, mount non-bootable
+#define MSF_CD_AUDIO           0x0020  // cdFS handler understands audio-only discs; mount them via cdFS (non-bootable)
 
 struct MountStruct
 {

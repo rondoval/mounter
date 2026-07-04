@@ -1258,14 +1258,19 @@ static bool UnitIsReady(struct IOStdReq *req)
 }
 
 
-// Check if this is a data disc by reading the TOC and checking that track 1 is a data track.
-static bool isDataCD(struct IOStdReq *ior)
+// Disc classes derived from the TOC.
+#define CDDISC_UNKNOWN 0	// TOC unreadable/implausible (blank disc, drive error)
+#define CDDISC_DATA    1	// track 1 is a data track
+#define CDDISC_AUDIO   2	// track 1 is an audio track
+
+// Classify the disc by reading the TOC and checking track 1's data-track bit.
+static int ClassifyCD(struct IOStdReq *ior)
 {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Warray-bounds="
 	struct ExecBase *SysBase = *(struct ExecBase **)4UL;
 #pragma GCC diagnostic pop
-	bool ret = false;
+	int ret = CDDISC_UNKNOWN;
 
 	BYTE err;
 
@@ -1302,9 +1307,8 @@ static bool isDataCD(struct IOStdReq *ior)
 
 			if (err == 0) {
 				if (tocBuf->firstTrack == 1 && tocBuf->td[0].trackNumber == 1) {
-					if (tocBuf->td[0].adrControl & 0x04) {	// Data Track?
-						ret = true;
-					}
+					// Data track bit
+					ret = (tocBuf->td[0].adrControl & 0x04) ? CDDISC_DATA : CDDISC_AUDIO;
 				}
 			}
 
@@ -1405,36 +1409,46 @@ static LONG mount_recipe(struct MountData *md, const struct MountFS *fs,
 	return 1;
 }
 
-// Mount a data CDROM (Amiga-bootable ones get boot priority)
+// Mount a CDROM (Amiga-bootable data discs get boot priority). Audio-only
+// discs mount only when the cdFS recipe's filesystem declares audio support
+// (MSF_CD_AUDIO, e.g. ODFileSystem presenting tracks as WAV files).
 static LONG ScanCDROM(struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
 	const struct MountFS *fs = md->cdFS;
 	struct MountFS classicCD;
 	UBYTE dosName[DEVNAME_BUFSIZE];
-	LONG bootPri;
-	LONG isBootable;
+	LONG bootPri = -1; // May not be a boot disk, lower priority than HDD
 
 	if (!UnitIsReady((struct IOStdReq *)md->request))
 		return -1;
 
-	if (!isDataCD((struct IOStdReq *)md->request))
-		return -1;
+	switch (ClassifyCD((struct IOStdReq *)md->request)) {
+	case CDDISC_DATA:
+	{
+		// "CDTV" or "AMIGA BOOT"?
+		LONG isBootable = CheckPVD((struct IOStdReq *)md->request,SysBase);
 
-	// "CDTV" or "AMIGA BOOT"?
-	isBootable = CheckPVD((struct IOStdReq *)md->request,SysBase);
-
-	if (isBootable == -1) {
-		// ISO PVD Not found, RDB CD?
-		if (md->flags & MSF_NO_RDB)
-			return -1;
-		return ScanRDSK(md);
-	} else {
-		if (isBootable) {
-			bootPri = 2; // Yes, give priority
-		} else {
-			bootPri = -1; // May not be a boot disk, lower priority than HDD
+		if (isBootable == -1) {
+			// ISO PVD Not found, RDB CD?
+			if (md->flags & MSF_NO_RDB)
+				return -1;
+			return ScanRDSK(md);
 		}
+		if (isBootable)
+			bootPri = 2; // Yes, give priority
+		break;
+	}
+	case CDDISC_AUDIO:
+		// No PVD to check: audio sectors are not readable via CMD_READ.
+		if (!fs || !(md->flags & MSF_CD_AUDIO)) {
+			printf("Audio disc and no audio-capable CD filesystem.\n");
+			return -1;
+		}
+		break;
+	default:
+		printf("Unrecognized disc TOC.\n");
+		return -1;
 	}
 
 	if (!fs) {
