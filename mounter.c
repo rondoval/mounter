@@ -131,6 +131,7 @@ struct MountData
 	const struct MountFS *fatFS;
 	const struct MountFS *ntfsFS;
 	const struct MountFS *cdFS;
+	ULONG dmaAlign;                 /* requested buffer alignment in bytes, 0 = default */
 	BOOL legacyMounted;             /* per unit, for MSF_LEGACY_FIRST_ONLY */
 };
 
@@ -1383,9 +1384,17 @@ static LONG mount_recipe(struct MountData *md, const struct MountFS *fs,
 	pp.de.de_LowCyl         = lowCyl;
 	pp.de.de_HighCyl        = highCyl;
 	pp.de.de_NumBuffers     = fs->buffers ? fs->buffers : 5;
-	pp.de.de_BufMemType     = MEMF_ANY|MEMF_CLEAR;
 	pp.de.de_MaxTransfer    = fs->maxTransfer ? fs->maxTransfer : 0x100000;
-	pp.de.de_Mask           = 0x7FFFFFFE;
+	/* When the host controller reports a DMA alignment, put the filesystem's
+	 * buffer cache in Fast memory and require that alignment
+	 * via de_Mask. Otherwise keep classic behavior. */
+	if (md->dmaAlign > 1) {
+		pp.de.de_BufMemType = MEMF_FAST|MEMF_PUBLIC|MEMF_CLEAR;
+		pp.de.de_Mask       = 0x7FFFFFFE & ~((ULONG)md->dmaAlign - 1);
+	} else {
+		pp.de.de_BufMemType = MEMF_ANY|MEMF_CLEAR;
+		pp.de.de_Mask       = 0x7FFFFFFE;
+	}
 	pp.de.de_DosType        = fs->dosType;
 	pp.de.de_BootPri        = bootPri;
 	if (fs->control) {
@@ -2018,6 +2027,7 @@ LONG MountDrive(struct MountStruct *ms)
 	md->fatFS = ms->fatFS;
 	md->ntfsFS = ms->ntfsFS;
 	md->cdFS = ms->cdFS;
+	md->dmaAlign = ms->dmaAlign;
 
 	port = W_CreateMsgPort(SysBase);
 	if (!port)

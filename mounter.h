@@ -77,6 +77,12 @@ struct MountStruct
 	// Recipe for ISO9660 data CDs. NULL: classic behavior (CD01/CDVD from
 	// FileSystem.resource only).
 	const struct MountFS *cdFS;
+	// Recommended DMA buffer alignment in bytes (a power of two).
+	// Nonzero: recipe-mounted filesystems get their buffers in
+	// MEMF_FAST | MEMF_PUBLIC (de_BufMemType) with de_Mask enforcing
+	// this alignment.
+	// 0: classic behavior (de_BufMemType MEMF_ANY, de_Mask word-aligned).
+	ULONG dmaAlign;
 };
 
 APTR W_CreateIORequest(struct MsgPort *ioReplyPort, ULONG size, struct ExecBase *SysBase);
