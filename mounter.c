@@ -1726,11 +1726,11 @@ static void print_guid(GUID *x)
 			(ULONG)x->u.UUID.node[3], (ULONG)x->u.UUID.node[4], (ULONG)x->u.UUID.node[5]);
 }
 
-// Microsoft Basic Data Partition GUID (used for FAT and NTFS)
+// Microsoft Basic Data Partition GUID (used for FAT, exFAT and NTFS),
 // EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
 static const GUID GUID_BASIC_DATA = {{
-	{ 0xEBD0A0A2, 0xB9E5, 0x4433, 0x87, 0xC0,
-	  { 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 } }
+	.raw = { 0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+	         0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 }
 }};
 
 static int guid_equal(const GUID *a, const GUID *b)
