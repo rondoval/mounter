@@ -18,10 +18,6 @@
 //    this list of conditions and the following disclaimer in the documentation
 //    and/or other materials provided with the distribution.
 //
-#ifdef DEBUG_MOUNTER
-#define USE_SERIAL_OUTPUT
-#endif
-
 #include <exec/types.h>
 #include <exec/memory.h>
 #include <exec/alerts.h>
@@ -61,22 +57,13 @@
 #define HD_WIDESCSI 8
 #endif
 
-#define TRACE 1
-#undef TRACE_LSEG
-#define Trace printf
-
-#ifdef TRACE_LSEG
-#define dbg_lseg printf
-#else
-#define dbg_lseg(x...) do { } while (0)
-#endif
-
-#if TRACE
-#define dbg Trace
-#else
-#define dbg
-#endif
-
+// Two independent, host-configured logging tiers:
+//  - printf(): important output (errors/warnings/partition dumps). Routed to
+//    the host-provided mounter_log() sink when MOUNTER_LOG is defined by the
+//    build; otherwise compiles away entirely.
+//  - dbg(): verbose per-step tracing, layered on top of printf(). Define
+//    MOUNTER_TRACE=1 from the build to enable it; off by default. Still
+//    compiles away if MOUNTER_LOG is undefined, since dbg() -> printf().
 #if defined(MOUNTER_LOG)
 // Host-provided log sink (e.g. the Poseidon debug backend). It may format with
 // exec RawDoFmt, so format strings here use %l-sized conversions only (no %p).
@@ -85,6 +72,19 @@ void mounter_log(const char *fmt, ...);
 #else
 #define printf(...)
 #endif
+
+#ifndef MOUNTER_TRACE
+#define MOUNTER_TRACE 0
+#endif
+
+#if MOUNTER_TRACE
+#define dbg printf
+#else
+/* Swallow the whole call: a bare `#define dbg` leaves the argument list behind
+ * as a comma expression, which every caller then warns about. */
+#define dbg(x...) do { } while (0)
+#endif
+
 #define MAX_BLOCKSIZE 4096
 #define LSEG_DATASIZE (512 / 4 - 5)
 
@@ -348,7 +348,6 @@ static BOOL readblock(UBYTE *buf, ULONG block, ULONG id, struct MountData *md)
 		return FALSE;
 	}
 	ULONG v = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | (buf[3] << 0);
-	dbg_lseg("Read block %lu %08lx\n", block, v);
 	if (id != 0xffffffff) {
 		if (v != id) {
 			return FALSE;
@@ -363,7 +362,6 @@ static BOOL readblock(UBYTE *buf, ULONG block, ULONG id, struct MountData *md)
 // Read multiple longs from LSEG blocks
 static BOOL lseg_read_longs(struct MountData *md, ULONG longs, ULONG *data)
 {
-	dbg_lseg("lseg_read_longs, longs %ld  ptr 0x%08lx, remaining %ld\n", longs, (ULONG)data, md->lseglongs);
 	ULONG cnt = 0;
 	md->lseghasword = FALSE;
 	while (longs > cnt) {
@@ -386,7 +384,6 @@ static BOOL lseg_read_longs(struct MountData *md, ULONG longs, ULONG *data)
 			}
 			md->lseglongs = LSEG_DATASIZE;
 			md->lsegoffset = 0;
-			dbg_lseg("lseg_read_long lseg block %ld loaded, next %ld\n", md->lsegblock, md->lsegbuf->lsb_Next);
 			md->lsegblock = md->lsegbuf->lsb_Next;
 		}
 	}
@@ -405,7 +402,6 @@ static BOOL lseg_read_long(struct MountData *md, ULONG *data)
 	} else {
 		v = lseg_read_longs(md, 1, data);
 	}
-	dbg_lseg("lseg_read_long %08lx\n", *data);
 	return v;
 }
 // Read single word from LSEG blocks

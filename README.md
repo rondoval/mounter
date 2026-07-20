@@ -245,6 +245,10 @@ Diagnostics: build with `-DMOUNTER_LOG` and provide
 strings use `%l`-sized conversions only, so a RawDoFmt-based sink formats them
 correctly. Without `MOUNTER_LOG`, all output compiles away.
 
+Add `-DMOUNTER_TRACE=1` on top of `-DMOUNTER_LOG` for verbose per-step tracing
+(RDB/partition/hunk-loader progress), layered on the same `mounter_log` sink.
+Off by default; still compiles away entirely if `MOUNTER_LOG` is undefined.
+
 ---
 
 ## 6. License

@@ -43,6 +43,9 @@ behavior; existing callers only need to drop `cdBoot` (see Removed).
 - **`MOUNTER_LOG` diagnostics hook**: define it and provide
   `mounter_log(fmt, ...)` to receive all mounter output (format strings are
   `%l`-normalized, safe for exec RawDoFmt sinks).
+- **`MOUNTER_TRACE` verbosity knob** (now documented; was already wired up):
+  define `MOUNTER_TRACE=1` on top of `MOUNTER_LOG` for verbose per-step
+  tracing, layered on the same sink.
 
 ## Changed
 
@@ -83,6 +86,11 @@ behavior; existing callers only need to drop `cdBoot` (see Removed).
   use `MSF_NO_LEGACY` at runtime instead
 - **`ndkcompat.h`**: gone; format strings use literal `%ld`/`%lu`/`%lx`
 - **MS0–MS9/CD0–CD9 name probing**: replaced by collision handling above
+- **Dead logging knobs**: `DEBUG_MOUNTER`/`USE_SERIAL_OUTPUT` (unreferenced
+  anywhere), the unused `Trace` alias, and `TRACE_LSEG`/`dbg_lseg` (its "on"
+  branch was permanently unreachable — the code force-`#undef`'d `TRACE_LSEG`
+  right before checking it). `MOUNTER_LOG`/`MOUNTER_TRACE` are the only
+  logging knobs now.
 
 ## Fixed
 
