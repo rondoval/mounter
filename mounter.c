@@ -396,9 +396,10 @@ static BOOL lseg_read_long(struct MountData *md, ULONG *data)
 	if (md->lseghasword) {
 		ULONG temp;
 		v = lseg_read_longs(md, 1, &temp);
-		*data = (md->lsegwordbuf << 16) | (temp >> 16);
-		md->lsegwordbuf = (UWORD)temp;
-		md->lseghasword = TRUE;
+		if (v) {
+			*data = (md->lsegwordbuf << 16) | (temp >> 16);
+			md->lsegwordbuf = (UWORD)temp;
+		}
 	} else {
 		v = lseg_read_longs(md, 1, data);
 	}
