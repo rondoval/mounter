@@ -1,8 +1,10 @@
 # Changelog — poseidon-fixes fork
 
 All changes are relative to the upstream a4091-software mounter (`main`).
-`struct MountStruct` grew, but zero-filling the new fields keeps the classic
-behavior; existing callers only need to drop `cdBoot` (see Removed).
+`struct MountStruct` and `struct MountFS` both grew, but zero-filling the new
+fields keeps the classic behavior; existing callers only need to drop `cdBoot`
+(see Removed) and rebuild. Both structs are caller-allocated and every field is
+read, so caller and mounter must always be built from the same header.
 
 ## New
 
@@ -16,6 +18,13 @@ behavior; existing callers only need to drop `cdBoot` (see Removed).
   registered, the DeviceNode gets `dn_Handler` = the recipe's handler file
   (`dn_GlobalVec = -1`), so DOS loads the filesystem on first access.
   Partitions whose recipe resolves to neither are skipped cleanly.
+- **`fsFlags` in `MountFS`**: per-recipe behavior
+  - `MOUNTFS_FORCELOAD`: try the recipe's handler file *before*
+    `FileSystem.resource`, keeping a registered dostype as the fallback. What
+    `ForceLoad = 1` does in a mountlist: a controller ROM registering an old
+    filesystem under a well-known dostype (`CD01` is the usual one) no longer
+    shadows the handler the caller asked for, while a machine carrying that
+    handler only in ROM still mounts.
 - **`flags` in `MountStruct`**: gate behavior at runtime
   - `MSF_NO_RDB`, `MSF_NO_LEGACY`, `MSF_NO_CD`: skip the three scans
   - `MSF_LEGACY_FIRST_ONLY`: mount only the first MBR/GPT/superfloppy filesystem per unit
@@ -23,6 +32,12 @@ behavior; existing callers only need to drop `cdBoot` (see Removed).
   - `MSF_CD_AUDIO`: `cdFS` filesystem understands audio-only discs (e.g.
     ODFileSystem presenting tracks as WAV); mount them non-bootable (no PVD
     check) instead of rejecting via data-track TOC gate
+  - `MSF_CD_ANYFMT`: `cdFS` filesystem identifies disc formats itself (e.g.
+    ODFileSystem: High Sierra, UDF, HFS and HFS+ besides ISO 9660 with Joliet
+    and Rock Ridge). A data disc with no ISO 9660 PVD is handed to it instead
+    of being rejected, and an unreadable TOC is treated as a data disc.
+    Without the flag the classic rule holds: data discs must be ISO 9660,
+    which is all a legacy CDFileSystem can read anyway.
 - **Explicit unit mounting (hotplug)**: `unitNum` now works as advertised
   - NULL: scan SCSI targets 0–7 (classic behavior)
   - value < 0x100: mount that single unit
@@ -43,6 +58,13 @@ behavior; existing callers only need to drop `cdBoot` (see Removed).
   - data CDs mount via the `cdFS` recipe
   - Amiga-bootable CDs ("AMIGA BOOT"/"CDTV") get boot priority
   - RDB-formatted CDs still work
+  - `CheckPVD()` reports four states (`PVD_ERROR`/`PVD_NONE`/`PVD_DATA`/
+    `PVD_AMIGABOOT`) rather than folding "sector 16 unreadable" and "no ISO
+    PVD" into one `-1`. Its only job now is boot priority; identifying the
+    disc's format is the handler's (see `MSF_CD_ANYFMT`)
+  - `ClassifyCD()` requires `scsi_Status == 0` as well as a clean `io_Error`
+    before trusting the TOC buffer, so a CHECK CONDITION on the last retry no
+    longer parses zeros
 - **Device-name collision handling**: names get a trailing digit ensured
   ("UMSD" → "UMSD0") and bumped past collisions ("UMSD1" … "UMSD10"), checked
   against both the pre-boot MountList and the live DOS lists, so hotplugging a

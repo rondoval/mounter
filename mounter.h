@@ -4,6 +4,10 @@
 // How to mount one filesystem family found on non-RDB media (MBR/GPT
 // partitions, superfloppies, data CDs). All strings are C strings owned by
 // the caller for the duration of MountDrive().
+//
+// The caller allocates this, and the mounter reads every field, so it must be
+// zero-filled. There is no mixed-version compatibility: a caller compiled against an older,
+// shorter MountFS hands the mounter whatever lies past the end of its object.
 struct MountFS
 {
 	// de_DosType and the FileSystem.resource lookup key.
@@ -24,15 +28,24 @@ struct MountFS
 	ULONG maxTransfer;
 	// dn_StackSize when the handler comes from 'handler'. 0: 8192.
 	ULONG stackSize;
+	// MOUNTFS_* flags. 0: classic behavior.
+	ULONG fsFlags;
 };
+
+// MountFS flags.
+#define MOUNTFS_FORCELOAD      0x0001  // prefer 'handler' over a FileSystem.resource entry
+                                       // with the same dostype (mountlist ForceLoad=1)
 
 // MountStruct flags.
 #define MSF_NO_RDB             0x0001  // skip RDB scanning
 #define MSF_NO_LEGACY          0x0002  // skip MBR/GPT/superfloppy scanning
-#define MSF_NO_CD              0x0004  // skip CD mounting (ISO9660 and RDB-CD)
+#define MSF_NO_CD              0x0004  // skip CD mounting (data discs, audio discs and RDB-CD)
 #define MSF_LEGACY_FIRST_ONLY  0x0008  // mount only the first MBR/GPT/superfloppy filesystem per unit
 #define MSF_NO_BOOT            0x0010  // never create pre-DOS boot nodes, mount non-bootable
 #define MSF_CD_AUDIO           0x0020  // cdFS handler understands audio-only discs; mount them via cdFS (non-bootable)
+#define MSF_CD_ANYFMT          0x0040  // cdFS handler identifies disc formats itself (High Sierra,
+                                       // UDF, HFS/HFS+ as well as ISO9660); mount a data disc that
+                                       // has no ISO9660 PVD instead of rejecting it
 
 struct MountStruct
 {
@@ -74,8 +87,10 @@ struct MountStruct
 	const struct MountFS *fatFS;
 	// Recipe for NTFS partitions/superfloppies. NULL: NTFS is skipped.
 	const struct MountFS *ntfsFS;
-	// Recipe for ISO9660 data CDs. NULL: classic behavior (CD01/CDVD from
-	// FileSystem.resource only).
+	// Recipe for data CDs (and, with MSF_CD_AUDIO, audio-only discs). What
+	// format the disc actually carries is the handler's business; see
+	// MSF_CD_ANYFMT. NULL: classic behavior (CD01/CDVD from
+	// FileSystem.resource only, ISO9660 discs only).
 	const struct MountFS *cdFS;
 	// Recommended DMA buffer alignment in bytes (a power of two).
 	// Nonzero: recipe-mounted filesystems get their buffers in
@@ -84,8 +99,6 @@ struct MountStruct
 	// 0: classic behavior (de_BufMemType MEMF_ANY, de_Mask word-aligned).
 	ULONG dmaAlign;
 	// Recipe for exFAT partitions/superfloppies. NULL: exFAT is skipped.
-	// Appended here rather than next to ntfsFS so the offsets above stay
-	// put for callers built against an older header.
 	const struct MountFS *exfatFS;
 };
 

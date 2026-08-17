@@ -47,16 +47,24 @@ filesystems, and make the partitions available to the operating system.
       its own recipe; the MBR type byte / GPT type GUID is treated only as a
       hint (type `0x07` is NTFS *and* exFAT). Unsupported content is skipped
       instead of mounted wrongly.
-    * **CD-ROM**: ISO 9660 data CDs mount as read-only volumes; Amiga-bootable
-      CDs ("AMIGA BOOT" / "CDTV" system ID) get boot priority; RDB-formatted
-      CDs are also supported.
+    * **CD-ROM**: data discs mount as read-only whole-medium volumes and
+      Amiga-bootable CDs ("AMIGA BOOT" / "CDTV" system ID) get boot priority;
+      RDB-formatted CDs are also supported. Which *formats* are accepted is the
+      CD recipe's call: by default the disc must be ISO 9660, but a handler
+      that identifies formats itself (`MSF_CD_ANYFMT`) is handed any data disc,
+      and one that understands audio tracks (`MSF_CD_AUDIO`) is handed
+      audio-only discs too.
 * **Filesystem recipes**: the caller controls, per filesystem family
   (FAT/NTFS/exFAT/CD), the dostype, an optional handler file loaded by DOS on
   first access (no FileSystem.resource entry needed), the preferred DOS device
-  name, `de_Control`, buffers, MaxTransfer and stack size. See
-  `struct MountFS`. A recipe whose dostype is unregistered *and* whose handler
-  file cannot be found is skipped rather than mounted into a node that fails on
-  first access (checked only post-DOS, from a Process).
+  name, `de_Control`, buffers, MaxTransfer, stack size and `MOUNTFS_*` flags.
+  See `struct MountFS`. A recipe whose dostype is unregistered *and* whose
+  handler file cannot be found is skipped rather than mounted into a node that
+  fails on first access (checked only post-DOS, from a Process).
+  `MOUNTFS_FORCELOAD` inverts the usual resolution order so the recipe's
+  handler file wins over a `FileSystem.resource` entry claiming the same
+  dostype — the mountlist `ForceLoad = 1`, for dostypes a controller ROM is
+  likely to have taken already.
 * **Explicit unit mounting**: besides the classic full SCSI scan, a caller can
   mount a single unit or a list of units (hotplug drivers), with per-unit
   results reported back.
@@ -136,9 +144,14 @@ The logical flow of the `MountDrive` function is as follows:
       classify block 0 (`ScanLegacy`, unless `MSF_NO_LEGACY`): a GPT (gated by
       its protective MBR entry and a validated header at block 1), else a
       filesystem VBR at block 0 (superfloppy), else a sane MBR.
-    * **CD/WORM/optical devices** (unless `MSF_NO_CD`): check unit ready and
-      that track 1 is a data track, then the ISO PVD (`CheckPVD`) for
-      "AMIGA BOOT"/"CDTV" (boot priority). No PVD → RDB-CD fallback.
+    * **CD/WORM/optical devices** (unless `MSF_NO_CD`): check unit ready, then
+      classify the disc from its TOC (`ClassifyCD`: data track 1, audio track 1,
+      or unreadable). For a data disc, read the ISO PVD (`CheckPVD`) — used for
+      "AMIGA BOOT"/"CDTV" boot priority only. No PVD → RDB-CD fallback, then
+      mount anyway if the recipe declares `MSF_CD_ANYFMT` (an unreadable
+      sector 16 is still refused). An unreadable TOC is likewise treated as a
+      data disc under `MSF_CD_ANYFMT`, since some enclosures answer READ TOC
+      poorly for DVD/BD media.
 
 4.  **Partition Processing**:
     * The appropriate parser iterates the entries: `ParseRDSK`/`ParsePART`
@@ -153,8 +166,10 @@ The logical flow of the `MountDrive` function is as follows:
     * **Legacy/CD paths**: `mount_recipe()` builds the `DeviceNode` from the
       recipe — a registered dostype resolves via `FileSystem.resource`,
       otherwise the recipe's handler file is attached (`dn_Handler`,
-      `dn_GlobalVec = -1`) for DOS to load on first access. Partitions whose
-      recipe resolves to neither are skipped before any node is created.
+      `dn_GlobalVec = -1`) for DOS to load on first access. With
+      `MOUNTFS_FORCELOAD` the handler file is tried first and the resource
+      entry becomes the fallback. Partitions whose recipe resolves to neither
+      are skipped before any node is created.
     * The `DeviceNode` is created with `MakeDosNode()` and added via
       `AddBootNode()` (bootable, pre-DOS) or `AddDosNode()` — the same rule on
       every path; `MSF_NO_BOOT` forces non-bootable.

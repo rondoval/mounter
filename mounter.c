@@ -137,7 +137,7 @@ struct MountData
 };
 
 // Classic recipe: FAT95 dostype, FileSystem.resource only.
-static const struct MountFS defaultFatFS = { 0x46415401, NULL, NULL, NULL, 0, 0, 0 };
+static const struct MountFS defaultFatFS = { 0x46415401, NULL, NULL, NULL, 0, 0, 0, 0 };
 
 // Copy a C string into a freshly allocated BCPL string: length byte, chars, and
 // a trailing NUL (from MEMF_CLEAR) so it doubles as a C string. Used for
@@ -1091,12 +1091,17 @@ static BOOL FileSystemAvailable(struct MountData *md, const struct MountFS *fs)
 
 // Attach handler information to a fresh DeviceNode: the FileSystem.resource
 // entry if the dostype is registered, else the recipe's handler file (loaded
-// by DOS on first access).
+// by DOS on first access). MOUNTFS_FORCELOAD swaps that order for recipes that
+// must not lose to a stale controller-ROM filesystem sitting on their dostype
+// (what ForceLoad=1 does in a mountlist), keeping the resource entry as the
+// fallback for machines that carry the handler in ROM and nowhere else.
 static BOOL SetupFileSystem(struct MountData *md, struct DeviceNode *dn, const struct MountFS *fs)
 {
 	struct ExecBase *SysBase = md->SysBase;
 	struct FileSysEntry *fse = find_filesystem(fs->dosType, 0, SysBase);
-	if (fse) {
+	BOOL forceLoad = fs->handler && (fs->fsFlags & MOUNTFS_FORCELOAD);
+
+	if (fse && !forceLoad) {
 		ProcessPatchFlags(dn, fse);
 		return TRUE;
 	}
@@ -1108,6 +1113,10 @@ static BOOL SetupFileSystem(struct MountData *md, struct DeviceNode *dn, const s
 			dn->dn_StackSize = fs->stackSize ? fs->stackSize : 8192;
 			return TRUE;
 		}
+	}
+	if (fse) {
+		ProcessPatchFlags(dn, fse);
+		return TRUE;
 	}
 	return FALSE;
 }
@@ -1328,7 +1337,12 @@ static int ClassifyCD(struct IOStdReq *ior)
 					break;
 			}
 
-			if (err == 0) {
+			// The loop also falls out on exhausted retries, so re-test
+			// what it was waiting for. io_Error alone is not enough: a
+			// CHECK CONDITION completes the request cleanly (err == 0)
+			// and reports the drive's refusal in scsi_Status, leaving
+			// the MEMF_CLEAR TOC buffer at zeros.
+			if (err == 0 && scsiCmd->scsi_Status == 0) {
 				if (tocBuf->firstTrack == 1 && tocBuf->td[0].trackNumber == 1) {
 					// Data track bit
 					ret = (tocBuf->td[0].adrControl & 0x04) ? CDDISC_DATA : CDDISC_AUDIO;
@@ -1342,9 +1356,20 @@ static int ClassifyCD(struct IOStdReq *ior)
 	return ret;
 }
 
+// CheckPVD results. Only PVD_AMIGABOOT decides anything about the disc's
+// contents; the rest tell ScanCDROM how much it may assume. PVD_NONE is not a
+// rejection - plenty of formats the CD handler reads (High Sierra, plain UDF,
+// HFS/HFS+) have nothing at all at sector 16 offset 1.
+#define PVD_ERROR      -2	// sector 16 unreadable
+#define PVD_NONE       -1	// readable, but no ISO9660 PVD
+#define PVD_DATA        0	// ISO9660, not Amiga-bootable
+#define PVD_AMIGABOOT   1	// ISO9660 with "CDTV" or "AMIGA BOOT" as the System ID
+
 // CheckPVD
-// Check for "CDTV" or "AMIGA BOOT" as the System ID in the PVD
-// Returns: -1 on error, 0 if not CDTV/AMIGA BOOT, 1 if bootable
+// Read the ISO9660 Primary Volume Descriptor to decide boot priority: is the
+// System ID "CDTV" or "AMIGA BOOT"? Identifying the disc's format is the CD
+// filesystem's job, not ours.
+// Returns: one of the PVD_* values above.
 static LONG CheckPVD(struct IOStdReq *ior, struct ExecBase *SysBase)
 {
 	const char sys_id_1[] = "CDTV";
@@ -1352,7 +1377,7 @@ static LONG CheckPVD(struct IOStdReq *ior, struct ExecBase *SysBase)
 	const char iso_id[]   = "CD001";
 
 	BYTE err = 0;
-	LONG ret = -1;
+	LONG ret = PVD_ERROR;
 	char *buf = NULL;
 
 	if (!(buf = AllocMem(2048,MEMF_ANY|MEMF_CLEAR))) goto done;
@@ -1370,9 +1395,11 @@ static LONG CheckPVD(struct IOStdReq *ior, struct ExecBase *SysBase)
 	}
 
 	if (err == 0) {
+		ret = PVD_NONE;
 		// Check ISO ID String & for PVD Version & Type code
 		if ((strncmp(iso_id,id_string,5) == 0) && buf[0] == 1 && buf[6] == 1) {
-			ret = (strncmp(sys_id_1,system_id,strlen(sys_id_1)) == 0 || strncmp(sys_id_2,system_id,strlen(sys_id_2)) == 0);
+			ret = (strncmp(sys_id_1,system_id,strlen(sys_id_1)) == 0 || strncmp(sys_id_2,system_id,strlen(sys_id_2)) == 0)
+			      ? PVD_AMIGABOOT : PVD_DATA;
 		}
 	}
 
@@ -1440,9 +1467,13 @@ static LONG mount_recipe(struct MountData *md, const struct MountFS *fs,
 	return 1;
 }
 
-// Mount a CDROM (Amiga-bootable data discs get boot priority). Audio-only
-// discs mount only when the cdFS recipe's filesystem declares audio support
-// (MSF_CD_AUDIO, e.g. ODFileSystem presenting tracks as WAV files).
+// Mount a CDROM (Amiga-bootable data discs get boot priority). What format the
+// disc carries is the cdFS recipe's filesystem's business; the recipe declares
+// what it can cope with. MSF_CD_ANYFMT means it identifies formats itself (e.g.
+// ODFileSystem: High Sierra, UDF, HFS/HFS+ besides ISO9660), MSF_CD_AUDIO that
+// it can present audio-only discs (ODFileSystem exposes the tracks as WAV
+// files). Without those a data disc has to be ISO9660 and an audio disc is
+// refused, which is all a legacy CDFileSystem can do.
 static LONG ScanCDROM(struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -1454,20 +1485,38 @@ static LONG ScanCDROM(struct MountData *md)
 	if (!UnitIsReady((struct IOStdReq *)md->request))
 		return -1;
 
-	switch (ClassifyCD((struct IOStdReq *)md->request)) {
+	int disc = ClassifyCD((struct IOStdReq *)md->request);
+
+	// Some enclosures answer READ TOC poorly for DVD/BD media - which is
+	// exactly the media UDF lives on. Give a self-identifying filesystem the
+	// benefit of the doubt; sector 16 still has to read back below.
+	if (disc == CDDISC_UNKNOWN && fs && (md->flags & MSF_CD_ANYFMT))
+		disc = CDDISC_DATA;
+
+	switch (disc) {
 	case CDDISC_DATA:
 	{
 		// "CDTV" or "AMIGA BOOT"?
-		LONG isBootable = CheckPVD((struct IOStdReq *)md->request,SysBase);
+		LONG pvd = CheckPVD((struct IOStdReq *)md->request,SysBase);
 
-		if (isBootable == -1) {
-			// ISO PVD Not found, RDB CD?
-			if (md->flags & MSF_NO_RDB)
+		if (pvd < PVD_DATA) {
+			// No ISO9660 PVD. RDB CD?
+			if (!(md->flags & MSF_NO_RDB)) {
+				LONG ret = ScanRDSK(md);
+				if (ret >= 0)
+					return ret;
+			}
+			// Not RDB either. A filesystem that identifies formats
+			// itself still reads this disc; a PVD-only one does not,
+			// and an unreadable sector 16 is nobody's disc.
+			if (pvd == PVD_ERROR || !fs || !(md->flags & MSF_CD_ANYFMT)) {
+				printf("Unrecognized disc.\n");
 				return -1;
-			return ScanRDSK(md);
-		}
-		if (isBootable)
+			}
+			// Mountable, but nothing on it claims to be bootable.
+		} else if (pvd == PVD_AMIGABOOT) {
 			bootPri = 2; // Yes, give priority
+		}
 		break;
 	}
 	case CDDISC_AUDIO:
