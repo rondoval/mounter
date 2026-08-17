@@ -83,6 +83,10 @@ struct MountStruct
 	// this alignment.
 	// 0: classic behavior (de_BufMemType MEMF_ANY, de_Mask word-aligned).
 	ULONG dmaAlign;
+	// Recipe for exFAT partitions/superfloppies. NULL: exFAT is skipped.
+	// Appended here rather than next to ntfsFS so the offsets above stay
+	// put for callers built against an older header.
+	const struct MountFS *exfatFS;
 };
 
 APTR W_CreateIORequest(struct MsgPort *ioReplyPort, ULONG size, struct ExecBase *SysBase);

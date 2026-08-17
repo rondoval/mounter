@@ -130,6 +130,7 @@ struct MountData
 	ULONG flags;                    /* MSF_* */
 	const struct MountFS *fatFS;
 	const struct MountFS *ntfsFS;
+	const struct MountFS *exfatFS;
 	const struct MountFS *cdFS;
 	ULONG dmaAlign;                 /* requested buffer alignment in bytes, 0 = default */
 	BOOL legacyMounted;             /* per unit, for MSF_LEGACY_FIRST_ONLY */
@@ -1057,11 +1058,35 @@ static void ProcessPatchFlags(struct DeviceNode *dn, struct FileSysEntry *fse)
 static struct FileSysEntry *find_filesystem(ULONG id1, ULONG id2, struct ExecBase *SysBase);
 
 // TRUE if the recipe can resolve to a working filesystem: the dostype is
-// registered in FileSystem.resource or a handler file is given. Checked
-// before creating a DeviceNode so unresolvable partitions are skipped clean.
+// registered in FileSystem.resource, or a handler file is given and can be
+// found on disk. Checked before creating a DeviceNode so unresolvable
+// partitions are skipped clean, rather than leaving a node that fails the
+// moment something touches it (a handler the user never installed).
+//
+// The file check needs DOS and a Process (Lock() is a packet), so pre-DOS boot
+// ROM mounts and task-context callers keep taking the handler on trust.
 static BOOL FileSystemAvailable(struct MountData *md, const struct MountFS *fs)
 {
-	return find_filesystem(fs->dosType, 0, md->SysBase) != NULL || fs->handler != NULL;
+	struct ExecBase *SysBase = md->SysBase;
+
+	if (find_filesystem(fs->dosType, 0, SysBase) != NULL)
+		return TRUE;
+	if (!fs->handler)
+		return FALSE;
+	if (md->DOSBase && SysBase->ThisTask->tc_Node.ln_Type == NT_PROCESS) {
+		struct DosLibrary *DOSBase = md->DOSBase;
+		struct Process *me = (struct Process *)SysBase->ThisTask;
+		// A handler path behind a missing assign must not pop a requester
+		// at the user in the middle of a hotplug mount.
+		APTR oldwin = me->pr_WindowPtr;
+		me->pr_WindowPtr = (APTR)-1;
+		BPTR lock = Lock((STRPTR)fs->handler, ACCESS_READ);
+		me->pr_WindowPtr = oldwin;
+		if (!lock)
+			return FALSE;
+		UnLock(lock);
+	}
+	return TRUE;
 }
 
 // Attach handler information to a fresh DeviceNode: the FileSystem.resource
@@ -1468,7 +1493,8 @@ static LONG ScanCDROM(struct MountData *md)
 		classicCD.dosType = fse->fse_DosType; // CD01 / CDVD
 		fs = &classicCD;
 	} else if (!FileSystemAvailable(md, fs)) {
-		printf("No filesystem for dostype 0x%08lx\n", fs->dosType);
+		printf("No filesystem for dostype 0x%08lx (%s)\n", fs->dosType,
+		       fs->handler ? (const char *)fs->handler : (const char *)"no handler");
 		return -1;
 	}
 
@@ -1495,8 +1521,20 @@ static int DetectVBR(const UBYTE *b, int blocksize)
 		return VBR_NONE;
 	if (memcmp(b + 3, "NTFS    ", 8) == 0)
 		return VBR_NTFS;
-	if (memcmp(b + 3, "EXFAT   ", 8) == 0)
+	if (memcmp(b + 3, "EXFAT   ", 8) == 0) {
+		// exFAT keeps its geometry outside the FAT BPB, so validate the
+		// fields the spec pins down instead: the MustBeZero region (the
+		// bytes a FAT/NTFS BPB would fill), and the two shifts/counts the
+		// filesystem itself refuses to mount without.
+		for (int i = 11; i < 64; i++)
+			if (b[i])
+				return VBR_NONE;
+		if (b[108] < 9 || b[108] > 12)          /* BytesPerSectorShift */
+			return VBR_NONE;
+		if (b[110] != 1 && b[110] != 2)         /* NumberOfFats */
+			return VBR_NONE;
 		return VBR_EXFAT;
+	}
 	if (b[0] != 0xeb && b[0] != 0xe9)          /* x86 jump opcode */
 		return VBR_NONE;
 	int bps = b[11] | (b[12] << 8);            /* BPB fields are little endian */
@@ -1538,6 +1576,9 @@ static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, UL
 	case VBR_NTFS:
 		fs = md->ntfsFS;   /* NULL: host mounts no NTFS */
 		break;
+	case VBR_EXFAT:
+		fs = md->exfatFS;  /* NULL: host mounts no exFAT */
+		break;
 	default:
 		break;
 	}
@@ -1547,8 +1588,9 @@ static LONG register_legacy(struct MountData *md, UBYTE bootable, UBYTE type, UL
 		return 0;
 	}
 	if (!FileSystemAvailable(md, fs)) {
-		printf("Skipping partition at %lu: no filesystem for dostype 0x%08lx\n",
-		       pstart, fs->dosType);
+		printf("Skipping partition at %lu: no filesystem for dostype 0x%08lx (%s)\n",
+		       pstart, fs->dosType,
+		       fs->handler ? (const char *)fs->handler : (const char *)"no handler");
 		return 0;
 	}
 
@@ -1791,7 +1833,7 @@ static LONG ParseGPT(UBYTE *hdr, struct MountData *md)
 		printf("\n");
 
 		if (!guid_equal(&gpt_par->partition_type, &GUID_BASIC_DATA)) {
-			printf("   Skipping non-FAT partition type\n");
+			printf("   Skipping partition: not a Basic Data type\n");
 			continue;
 		}
 		if ((last_lba >> 32) != 0) {
@@ -2023,6 +2065,7 @@ LONG MountDrive(struct MountStruct *ms)
 	md->flags = ms->flags;
 	md->fatFS = ms->fatFS;
 	md->ntfsFS = ms->ntfsFS;
+	md->exfatFS = ms->exfatFS;
 	md->cdFS = ms->cdFS;
 	md->dmaAlign = ms->dmaAlign;
 

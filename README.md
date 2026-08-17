@@ -43,16 +43,20 @@ filesystems, and make the partitions available to the operating system.
     * **Superfloppy**: a filesystem at block 0 with no partition table mounts
       as a whole-disk device.
     * **Content sniffing**: each legacy partition's boot sector is inspected
-      (`DetectVBR`) — FAT, NTFS and exFAT are told apart; the MBR type byte /
-      GPT type GUID is treated only as a hint. Unsupported content is skipped
+      (`DetectVBR`) — FAT, NTFS and exFAT are told apart, each mounting through
+      its own recipe; the MBR type byte / GPT type GUID is treated only as a
+      hint (type `0x07` is NTFS *and* exFAT). Unsupported content is skipped
       instead of mounted wrongly.
     * **CD-ROM**: ISO 9660 data CDs mount as read-only volumes; Amiga-bootable
       CDs ("AMIGA BOOT" / "CDTV" system ID) get boot priority; RDB-formatted
       CDs are also supported.
 * **Filesystem recipes**: the caller controls, per filesystem family
-  (FAT/NTFS/CD), the dostype, an optional handler file loaded by DOS on first
-  access (no FileSystem.resource entry needed), the preferred DOS device name,
-  `de_Control`, buffers, MaxTransfer and stack size. See `struct MountFS`.
+  (FAT/NTFS/exFAT/CD), the dostype, an optional handler file loaded by DOS on
+  first access (no FileSystem.resource entry needed), the preferred DOS device
+  name, `de_Control`, buffers, MaxTransfer and stack size. See
+  `struct MountFS`. A recipe whose dostype is unregistered *and* whose handler
+  file cannot be found is skipped rather than mounted into a node that fails on
+  first access (checked only post-DOS, from a Process).
 * **Explicit unit mounting**: besides the classic full SCSI scan, a caller can
   mount a single unit or a list of units (hotplug drivers), with per-unit
   results reported back.

@@ -27,11 +27,18 @@ behavior; existing callers only need to drop `cdBoot` (see Removed).
   - NULL: scan SCSI targets 0–7 (classic behavior)
   - value < 0x100: mount that single unit
   - otherwise: points to `{count, unit...}` array (entries overwritten with per-unit results)
-- **NTFS/exFAT awareness and superfloppy support**: partition boot sectors
+- **NTFS/exFAT support and superfloppy support**: partition boot sectors
   are sniffed (`DetectVBR`)
-  - FAT mounts via `fatFS`, NTFS via `ntfsFS`
-  - exFAT and unknown content are skipped (previously everything mounted as FAT)
+  - FAT mounts via `fatFS`, NTFS via `ntfsFS`, exFAT via `exfatFS` (unknown
+    content is skipped — previously everything mounted as FAT)
+  - exFAT is identified by its `"EXFAT   "` signature plus the fields the spec
+    pins down (MustBeZero region, BytesPerSectorShift, FAT count), so a stray
+    signature cannot claim a partition
   - filesystem at block 0 (superfloppy) mounts as a whole-disk device
+- **Handler files are checked before mounting**: a recipe whose dostype is not
+  in FileSystem.resource and whose handler file cannot be located is skipped,
+  instead of producing a DeviceNode that fails when DOS first tries to load it.
+  Needs DOS and a Process, so pre-DOS (boot ROM) mounts are unchanged.
 - **Non-boot CD mounting**:
   - data CDs mount via the `cdFS` recipe
   - Amiga-bootable CDs ("AMIGA BOOT"/"CDTV") get boot priority
