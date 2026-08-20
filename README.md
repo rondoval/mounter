@@ -3,8 +3,9 @@
 Generic autoboot / automount partition parser and mounter: RDB, MBR, GPT,
 superfloppy and data CDs.
 
-This is the mounter code from `a4091.device` (`poseidon-fixes` fork; see
-CHANGELOG.md for the differences against upstream).
+Originally the mounter code from `a4091.device`; this is the `poseidon-fixes`
+fork, which stopped tracking upstream and has since been restructured. See
+CHANGELOG.md for its history.
 
 ## 1. Introduction
 
@@ -22,6 +23,11 @@ adds are what `strap` boots from) and from a hotplug driver on a running
 system. Its primary function is to scan storage devices, interpret
 their partition maps (RDB, MBR, GPT, or none), load or locate the necessary
 filesystems, and make the partitions available to the operating system.
+
+It is built from four sources: `mounter.c` (entry, per-unit dispatch, and the
+single path that creates a `DeviceNode`), `mounter_rdb.c` (RDB, FSHD, hunk
+loader), `mounter_legacy.c` (MBR, EBR chains, GPT, superfloppy) and
+`mounter_cd.c` (CD/DVD/BD). `mounter_internal.h` carries what they share.
 
 ---
 
@@ -53,9 +59,10 @@ filesystems, and make the partitions available to the operating system.
       Amiga-bootable CDs ("AMIGA BOOT" / "CDTV" system ID) get boot priority;
       RDB-formatted CDs are also supported. Which *formats* are accepted is the
       CD recipe's call: by default the disc must be ISO 9660, but a handler
-      that identifies formats itself (`MSF_CD_ANYFMT`) is handed any data disc,
-      and one that understands audio tracks (`MSF_CD_AUDIO`) is handed
-      audio-only discs too.
+      that identifies formats itself (`MOUNTFS_CD_ANYFMT`) is handed any data
+      disc, and one that understands audio tracks (`MOUNTFS_CD_AUDIO`) is handed
+      audio-only discs too. Both are properties of the handler, so they are set
+      in the recipe's `fsFlags`.
 * **Filesystem recipes**: the caller controls, per filesystem family
   (FAT/NTFS/exFAT/CD), the dostype, an optional handler file loaded by DOS on
   first access (no FileSystem.resource entry needed), the preferred DOS device
@@ -67,10 +74,11 @@ filesystems, and make the partitions available to the operating system.
   handler file wins over a `FileSystem.resource` entry claiming the same
   dostype — the mountlist `ForceLoad = 1`, for dostypes a controller ROM is
   likely to have taken already.
-* **Explicit unit mounting**: the caller names the unit(s) to mount — a single
-  unit or a list — with per-unit results reported back. (The `poseidon-fixes`
-  fork dropped upstream's blind SCSI target/LUN scan; its consumers are not
-  SCSI hosts and always know their units.)
+* **Explicit unit mounting**: the caller passes a `units` array and a
+  `unitCount`, and optionally a `unitResults` array to receive each unit's
+  outcome. The input is never written to. (This fork dropped upstream's blind
+  SCSI target/LUN scan; its consumers are not SCSI hosts and always know their
+  units.)
 * **Collision-safe device naming**: preferred names get a trailing digit
   ensured ("UMSD" → "UMSD0") and bumped past collisions ("UMSD1" … "UMSD10"),
   checked against both the pre-boot MountList and the live DOS lists.
@@ -93,26 +101,44 @@ identify and mount partitions.
   passed to the `MountDrive` function. It defines the parameters for a mounting
   session.
     * `deviceName`: The name of the device driver to use (e.g., `scsi.device`).
-    * `unitNum`: required. A value < 0x100 = that single unit; otherwise a
-      pointer to a `{count, unit0, unit1, ...}` array. Array entries are
-      overwritten with each unit's result.
+    * `units`, `unitCount`: the unit numbers to probe. Both required.
+    * `unitResults`: OPTIONAL, `unitCount` entries, filled in with each unit's
+      result (-1 nothing recognized, 0 recognized but nothing mounted, >0 the
+      count, -2 skipped after an earlier `RDBFF_LAST`). NULL if not wanted.
     * `creatorName`: A string to identify the creator of the filesystem entries.
     * `configDev`: A pointer to the `ConfigDev` structure for an autoconfig
       board, essential for autobooting.
-    * `slowSpinup`, `ignoreLast`: Boolean flags controlling spin-up delays and
-      the handling of the RDB `RDBFF_LAST` flag.
-    * `flags`: `MSF_*` flags gating the RDB / MBR-GPT-superfloppy / CD scans
-      and boot-node creation.
-    * `fatFS`, `ntfsFS`, `cdFS`: filesystem recipes (see below); NULL keeps
-      the classic behavior.
+    * `flags`: `MSF_*` flags gating the RDB / MBR-GPT-superfloppy / CD scans,
+      boot-node creation, spin-up patience (`MSF_SLOW_SPINUP`) and whether
+      `RDBFF_LAST` ends the scan (`MSF_IGNORE_LAST`).
+    * `fs[]`: filesystem recipes indexed by `MOUNTFS_FAT` / `MOUNTFS_NTFS` /
+      `MOUNTFS_EXFAT` / `MOUNTFS_CD` (see below); a NULL entry means that
+      family is not mounted, except FAT, which falls back to the classic
+      dostype from `FileSystem.resource`.
     * `SysBase`: A pointer to the Exec library base.
+
+  The struct is pure input — the mounter never writes to it.
+
+* **`struct MountResult` (`mounter.h`)**: OPTIONAL second argument to
+  `MountDrive()`. Reports what the call did: `mounted`, `deferred` (volumes
+  whose handler needs a DOS that did not exist yet), `alreadyMounted` (extents
+  left alone because they were already mounted), `renamed` (DOS names bumped
+  past a collision) and `recognized`. Pass NULL if none of it is wanted.
 
 * **`struct MountFS` (`mounter.h`)**: A filesystem recipe for non-RDB media:
   dostype, optional handler file, preferred DOS device name, `de_Control`
-  string, buffers, MaxTransfer and handler stack size. All strings are owned
-  by the caller for the duration of `MountDrive()`.
+  string, buffers, MaxTransfer, handler stack size and `MOUNTFS_*` flags.
+  Those flags describe what the *handler* can do — `MOUNTFS_FORCELOAD`, and for
+  CD handlers `MOUNTFS_CD_AUDIO` / `MOUNTFS_CD_ANYFMT` — so they travel with
+  the recipe rather than with the session. All strings are owned by the caller
+  for the duration of `MountDrive()`.
 
-* **`struct MountData` (`mounter.c`)**: An internal state-management structure
+* **`struct Volume` (`mounter_internal.h`)**: One mountable volume as a scanner
+  found it — the `DosEnvec`, a name hint, a boot priority, and either a `MountFS`
+  recipe (CD and MBR/GPT paths) or a pre-resolved `FileSysEntry` (RDB path).
+  This is what every scanner hands to `mnt_mount_volume()`.
+
+* **`struct MountData` (`mounter_internal.h`)**: An internal state-management structure
   used during the `MountDrive` execution. It holds pointers to opened
   libraries, the I/O request, device geometry, and state variables for the
   scanning process.
@@ -128,50 +154,61 @@ The logical flow of the `MountDrive` function is as follows:
       device driver.
 
 2.  **Unit Selection**:
-    * Probe exactly the given unit(s) (`ScanUnitList`), writing each unit's
-      result back into the caller's array and honoring `RDBFF_LAST` unless
-      `ignoreLast` is set.
-    * Each unit is probed by `ProbeUnit()`: `OpenDevice()`, geometry, scan,
-      motor off, `CloseDevice()`.
+    * Probe exactly the given unit(s) (`scan_units`), reporting each unit's
+      result into `unitResults` if one was supplied and honoring `RDBFF_LAST`
+      unless `MSF_IGNORE_LAST` is set.
+    * Each unit is probed by `probe_unit()`: `OpenDevice()`, geometry, scan,
+      motor off, `CloseDevice()`. Each scanner answers only "did you recognize
+      this medium?"; `probe_unit()` turns that plus the count into the
+      -1/0/count the caller sees.
 
 3.  **Partition Scheme Identification** (per unit):
     * Get the geometry via `TD_GETGEOMETRY`; sector sizes 256–4096 are
       accepted.
     * **Direct-access devices**: try RDB first — scan the first
-      `RDB_LOCATION_LIMIT` blocks (`ScanRDSK`, unless `MSF_NO_RDB`). If no RDB,
-      classify block 0 (`ScanLegacy`, unless `MSF_NO_LEGACY`): a GPT (gated by
+      `RDB_LOCATION_LIMIT` blocks (`mnt_scan_rdb`, unless `MSF_NO_RDB`). If no RDB,
+      classify block 0 (`mnt_scan_legacy`, unless `MSF_NO_LEGACY`): a GPT (gated by
       its protective MBR entry and a validated header at block 1), else a
       filesystem VBR at block 0 (superfloppy), else a sane MBR.
     * **CD/WORM/optical devices** (unless `MSF_NO_CD`): check unit ready, then
-      classify the disc from its TOC (`ClassifyCD`: data track 1, audio track 1,
-      or unreadable). For a data disc, read the ISO PVD (`CheckPVD`) — used for
+      classify the disc from its TOC (`classify_cd`: data track 1, audio track 1,
+      or unreadable). For a data disc, read the ISO PVD (`read_pvd`) — used for
       "AMIGA BOOT"/"CDTV" boot priority only. No PVD → RDB-CD fallback, then
-      mount anyway if the recipe declares `MSF_CD_ANYFMT` (an unreadable
+      mount anyway if the recipe declares `MOUNTFS_CD_ANYFMT` (an unreadable
       sector 16 is still refused). An unreadable TOC is likewise treated as a
-      data disc under `MSF_CD_ANYFMT`, since some enclosures answer READ TOC
+      data disc under `MOUNTFS_CD_ANYFMT`, since some enclosures answer READ TOC
       poorly for DVD/BD media.
 
 4.  **Partition Processing**:
-    * The appropriate parser iterates the entries: `ParseRDSK`/`ParsePART`
-      (RDB), `ParseMBR`/`parse_extended` (MBR/EBR chains), `ParseGPT`,
-      or the whole-medium CD/superfloppy mount.
+    * The appropriate parser iterates the entries: `parse_rdsk`/`parse_part`
+      (RDB), `parse_mbr`/`parse_ebr` (MBR/EBR chains), `parse_gpt`,
+      or the whole-medium CD/superfloppy mount. Each of them ends by filling a
+      `struct Volume` and calling `mnt_mount_volume()`.
+    * Scratch sectors come from one four-slot LIFO pool
+      (`mnt_sector_take`/`mnt_sector_drop`) allocated on first use and released
+      when `MountDrive()` returns.
 
 5.  **Filesystem Loading & Mounting**:
-    * **RDB path**: `ParsePART` reads the partition's `DosEnvec`, then
-      `ParseFSHD` finds or loads the filesystem — `FileSystem.resource` is
+    * **RDB path**: `parse_part` reads the partition's `DosEnvec`, then
+      `parse_fshd` finds or loads the filesystem — `FileSystem.resource` is
       searched and, if absent or older, the filesystem is loaded from the
-      disk's FSHD blocks and relocated (`fsrelocate`).
-    * **Legacy/CD paths**: `mount_recipe()` builds the `DeviceNode` from the
-      recipe — a registered dostype resolves via `FileSystem.resource`,
+      disk's FSHD blocks and relocated (`fs_relocate`).
+    * **Legacy/CD paths**: the scanner resolves a recipe (`mnt_resolve_fs`) and
+      synthesises the `DosEnvec` from the block extent
+      (`mnt_envec_from_recipe`) — a registered dostype resolves via
+      `FileSystem.resource`,
       otherwise the recipe's handler file is attached (`dn_Handler`,
       `dn_GlobalVec = -1`) for DOS to load on first access. With
       `MOUNTFS_FORCELOAD` the handler file is tried first and the resource
       entry becomes the fallback. Partitions whose recipe resolves to neither
       are skipped before any node is created.
-    * The `DeviceNode` is created with `MakeDosNode()` and added via
-      `AddBootNode()` (`AddMountNode`), with a `ConfigDev` only when the mount
-      is bootable and pre-DOS — the same rule on every path; `MSF_NO_BOOT`
-      forces non-bootable.
+    * **Both paths then converge on `mnt_mount_volume()`**, the only function
+      that creates a node. In order: the duplicate-extent guard, the DOS name
+      (seeded and bumped past collisions), `MakeDosNode()`, the filesystem
+      attach, and `AddBootNode()` (`add_mount_node`) with a `ConfigDev` only
+      when the mount is bootable and pre-DOS. `MSF_NO_BOOT` forces
+      non-bootable. The extent guard runs first, so a volume already mounted on
+      an earlier pass never reaches the naming step.
 
 6.  **Cleanup & Result**:
     * All allocated resources (I/O requests, ports, library bases) are freed.
@@ -182,9 +219,9 @@ The logical flow of the `MountDrive` function is as follows:
 
 ## 4. Core Functionality Details
 
-### 4.1. Filesystem Relocation (`fsrelocate`)
+### 4.1. Filesystem Relocation (`fs_relocate`)
 
-A critical function is `fsrelocate`, which loads Amiga HUNK-formatted
+A critical function is `fs_relocate` (`mounter_rdb.c`), which loads Amiga HUNK-formatted
 filesystem binaries from disk into memory.
 1.  It starts by reading a `HUNK_HEADER`.
 2.  It pre-allocates memory for all hunks (`HUNK_CODE`, `HUNK_DATA`,
@@ -196,15 +233,17 @@ filesystem binaries from disk into memory.
 5.  Finally, it performs a `CacheClearU()` to ensure instruction caches are
     flushed before the OS attempts to execute the newly loaded code.
 
-### 4.2. Filesystem Resource Management (`FSHDProcess`, `FSHDAdd`)
+### 4.2. Filesystem Resource Management (`fse_from_fshb`, `fse_register`)
 
 The mounter interacts carefully with the central `FileSystem.resource`.
-* `FSHDProcess` is responsible for checking if a required filesystem
-  (identified by `DosType`) is already present in the resource list.
-* If a filesystem is not present, or if the version on disk is newer than the
-  one in memory, it allocates a new `FileSysEntry`.
-* After a filesystem is successfully loaded and relocated by `fsrelocate`,
-  `FSHDAdd` adds the new `FileSysEntry` to `FileSystem.resource`,
+* `mnt_find_filesystem` is the single lookup: given a dostype, it returns the
+  registered `FileSysEntry` or NULL.
+* `fse_from_fshb` builds a new `FileSysEntry` from an RDB `FileSysHeaderBlock`,
+  unless the resource already carries an entry for that dostype at the same
+  version or newer. Both the dostype and the version come out of the header
+  block, so there is nothing for the caller to pass alongside it.
+* After a filesystem is successfully loaded and relocated by `fs_relocate`,
+  `fse_register` adds the new `FileSysEntry` to `FileSystem.resource`,
   making it available for all subsequent mounting operations
   system-wide. If loading failed, the entry is freed and the mounter falls
   back to any already-registered filesystem for that dostype.

@@ -1,15 +1,78 @@
 # Changelog — poseidon-fixes fork
 
-All changes are relative to the upstream a4091-software mounter (`main`).
+**This fork no longer tracks upstream.** It began as the a4091-software mounter
+(`main`) and stayed mergeable with it for a long while, but the 2026-08 restructure
+below reorganised the module past the point where upstream changes can be merged.
+Fixes flow one way now: anything worth sending back has to be ported by hand. The
+sections after "2026-08" still describe the divergence from upstream, and are kept
+because they explain *why* the code looks the way it does — but they are history,
+not a diff you can apply.
 
 **The fork requires AmigaOS 3.1 (V40) and up** — upstream's Kickstart 1.3/2.x
 fallbacks are gone (see Removed).
 
-`struct MountStruct` and `struct MountFS` both grew, but zero-filling the new
-fields keeps the classic behavior; existing callers need to drop `cdBoot`,
-`luns` and `hostId` (see Removed) and rebuild. Both structs are
-caller-allocated and every field is read, so caller and mounter must always be
-built from the same header.
+## 2026-08 — restructure
+
+One mount path, four files, one naming convention. Behaviour is unchanged except
+where noted; every parse, clamp and retry count is exactly as it was.
+
+- **One node-creating site.** Three functions used to build a `DeviceNode`, each
+  with its own copy of: duplicate-extent check, DOS naming, `MakeDosNode()`,
+  filesystem attach, `AddBootNode()`. The scanners are now pure enumerators —
+  each fills a `struct Volume` and calls `mnt_mount_volume()`, which owns that
+  whole tail. `mount_recipe()` is gone.
+- **Fixed: `renamed` was inflated by the case it exists to detect.** The CD and
+  MBR/GPT paths fixed the DOS name *before* the duplicate-extent check, so a
+  second pass over an already-mounted volume bumped the name (and the counter)
+  before deciding not to mount anything. The unified path checks the extent first.
+- **One sector pool.** Eight `AllocMem(MAX_BLOCKSIZE)` sites became a four-slot
+  LIFO pool (`mnt_sector_take`/`mnt_sector_drop`), allocated on first use and
+  freed when `MountDrive()` returns. Eight out-of-memory paths became one, and a
+  10-partition RDB now allocates its FSHD sectors once instead of twenty times.
+- **One result convention.** `mnt_mount_volume()` returns a `MountOutcome` and
+  keeps the counters in step with it; scanners answer only "did you recognize this
+  medium?" and leave the count in the context. The `-1`/`0`/count encoding is
+  applied once, in `probe_unit()`.
+- **`FSHDProcess()` split into `fse_from_fshb()`**, losing an unreachable branch
+  and a `newOnly` parameter that served a mode nobody used. Its lookup-only call
+  was just `mnt_find_filesystem()` with extra steps.
+- **Hunk loader decoupled.** The six `lseg*` fields left `MountData` for a
+  `struct LSegStream` owned by `parse_fshd()`.
+- **Split into four sources** — `mounter.c`, `mounter_rdb.c`, `mounter_legacy.c`,
+  `mounter_cd.c`, plus `mounter_internal.h`. Only ten symbols cross a file
+  boundary; they take an `mnt_` prefix, everything else is `static`.
+- **One naming convention.** `PascalCase` = public API or an OS call,
+  `mnt_snake_case` = crosses a file boundary, `snake_case` = file-local. Linkage
+  is now visible at the call site.
+- **Warning-clean** under `-Wall -Wextra -Wconversion -Wsign-conversion -Wshadow
+  -Wmissing-prototypes -Wstrict-prototypes`. nvme.device's per-file suppression of
+  seven warning classes is deleted; both consumers now hold the mounter to that
+  set. Five dead `SysBase` declarations and one shadowed variable fell out of it.
+
+### API, this release
+
+Breaking. Both consumers were updated in the same change.
+
+```c
+LONG MountDrive(const struct MountStruct *ms, struct MountResult *res);
+```
+
+- `unitNum` (a `ULONG *` that meant a scalar unit when `< 0x100`) is replaced by
+  `units` + `unitCount`, with results reported into an optional `unitResults`
+  array. `MountStruct` is now pure input — the mounter no longer writes per-unit
+  results back over the caller's input.
+- The four positional recipe pointers became `fs[]`, indexed by `MOUNTFS_FAT` /
+  `MOUNTFS_NTFS` / `MOUNTFS_EXFAT` / `MOUNTFS_CD`.
+- `MSF_CD_AUDIO` / `MSF_CD_ANYFMT` became `MOUNTFS_CD_AUDIO` / `MOUNTFS_CD_ANYFMT`
+  in `MountFS.fsFlags`: they describe what the *handler* can do, not the session.
+- `slowSpinup` / `ignoreLast` became `MSF_SLOW_SPINUP` / `MSF_IGNORE_LAST`.
+- The `deferred` / `alreadyMounted` / `renamed` counters left `MountStruct` for
+  `struct MountResult`, which also carries `mounted` and `recognized`.
+
+---
+
+The sections below predate the restructure and describe the divergence from
+upstream a4091-software.
 
 ## New
 
