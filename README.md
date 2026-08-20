@@ -16,9 +16,10 @@ by Stefan Reinauer and Matt Harlum, it is used by the `a4091.device` and
 highly compatible solution for device drivers that need to mount partitions
 and filesystems — at boot time or at hotplug time.
 
-It is designed to be highly portable, 68000-compatible, and capable of
-operating in diverse environments, from a Kickstart 1.3 Boot ROM to a modern
-AmigaOS system. Its primary function is to scan storage devices, interpret
+It is designed to be highly portable and 68000-compatible, and to work equally
+well from a Kickstart-resident driver (before DOS exists, where the nodes it
+adds are what `strap` boots from) and from a hotplug driver on a running
+system. Its primary function is to scan storage devices, interpret
 their partition maps (RDB, MBR, GPT, or none), load or locate the necessary
 filesystems, and make the partitions available to the operating system.
 
@@ -26,8 +27,9 @@ filesystems, and make the partitions available to the operating system.
 
 ## 2. Core Features
 
-* **Broad OS Compatibility**: Full support for Kickstart 1.3 and newer,
-  including its specific autoboot mechanisms.
+* **OS Requirement**: AmigaOS 3.1 (V40) and up. The `poseidon-fixes` fork
+  dropped upstream's Kickstart 1.3/2.x fallbacks and uses the V36+ OS API
+  unconditionally.
 * **CPU Compatibility**: Compatible with the Motorola 68000 processor, ensuring
   it runs on all classic Amiga models.
 * **Autoboot Capability**: Can participate in the Amiga's autoconfig boot
@@ -65,17 +67,16 @@ filesystems, and make the partitions available to the operating system.
   handler file wins over a `FileSystem.resource` entry claiming the same
   dostype — the mountlist `ForceLoad = 1`, for dostypes a controller ROM is
   likely to have taken already.
-* **Explicit unit mounting**: besides the classic full SCSI scan, a caller can
-  mount a single unit or a list of units (hotplug drivers), with per-unit
-  results reported back.
+* **Explicit unit mounting**: the caller names the unit(s) to mount — a single
+  unit or a list — with per-unit results reported back. (The `poseidon-fixes`
+  fork dropped upstream's blind SCSI target/LUN scan; its consumers are not
+  SCSI hosts and always know their units.)
 * **Collision-safe device naming**: preferred names get a trailing digit
   ensured ("UMSD" → "UMSD0") and bumped past collisions ("UMSD1" … "UMSD10"),
   checked against both the pre-boot MountList and the live DOS lists.
-* **LUN Support**: Can scan for and mount devices on multiple Logical Unit
-  Numbers (LUNs).
 * **Hardened against corrupt media**: untrusted on-disk fields are clamped,
   block chains are cycle-capped, and the hunk relocator is overflow-checked
-  (see 4.5).
+  (see 4.4).
 
 ---
 
@@ -92,16 +93,14 @@ identify and mount partitions.
   passed to the `MountDrive` function. It defines the parameters for a mounting
   session.
     * `deviceName`: The name of the device driver to use (e.g., `scsi.device`).
-    * `unitNum`: NULL = classic scan of SCSI targets 0–7 (plus LUNs if
-      enabled); a value < 0x100 = that single unit; otherwise a pointer to a
-      `{count, unit0, unit1, ...}` array. Array entries are overwritten with
-      each unit's result.
+    * `unitNum`: required. A value < 0x100 = that single unit; otherwise a
+      pointer to a `{count, unit0, unit1, ...}` array. Array entries are
+      overwritten with each unit's result.
     * `creatorName`: A string to identify the creator of the filesystem entries.
     * `configDev`: A pointer to the `ConfigDev` structure for an autoconfig
       board, essential for autobooting.
-    * `luns`, `slowSpinup`, `ignoreLast`: Boolean flags to control behavior
-      like LUN scanning, spin-up delays, and handling of the RDB
-      `RDBFF_LAST` flag.
+    * `slowSpinup`, `ignoreLast`: Boolean flags controlling spin-up delays and
+      the handling of the RDB `RDBFF_LAST` flag.
     * `flags`: `MSF_*` flags gating the RDB / MBR-GPT-superfloppy / CD scans
       and boot-node creation.
     * `fatFS`, `ntfsFS`, `cdFS`: filesystem recipes (see below); NULL keeps
@@ -129,10 +128,9 @@ The logical flow of the `MountDrive` function is as follows:
       device driver.
 
 2.  **Unit Selection**:
-    * `unitNum == NULL`: iterate the SCSI targets 0–7 (and LUNs, if enabled),
-      honoring `RDBFF_LAST`/`RDBFF_LASTLUN` (`ScanAllUnits`).
-    * Otherwise: probe exactly the given unit(s) (`ScanUnitList`), writing each
-      unit's result back into the caller's array.
+    * Probe exactly the given unit(s) (`ScanUnitList`), writing each unit's
+      result back into the caller's array and honoring `RDBFF_LAST` unless
+      `ignoreLast` is set.
     * Each unit is probed by `ProbeUnit()`: `OpenDevice()`, geometry, scan,
       motor off, `CloseDevice()`.
 
@@ -171,8 +169,9 @@ The logical flow of the `MountDrive` function is as follows:
       entry becomes the fallback. Partitions whose recipe resolves to neither
       are skipped before any node is created.
     * The `DeviceNode` is created with `MakeDosNode()` and added via
-      `AddBootNode()` (bootable, pre-DOS) or `AddDosNode()` — the same rule on
-      every path; `MSF_NO_BOOT` forces non-bootable.
+      `AddBootNode()` (`AddMountNode`), with a `ConfigDev` only when the mount
+      is bootable and pre-DOS — the same rule on every path; `MSF_NO_BOOT`
+      forces non-bootable.
 
 6.  **Cleanup & Result**:
     * All allocated resources (I/O requests, ports, library bases) are freed.
@@ -209,31 +208,25 @@ The mounter interacts carefully with the central `FileSystem.resource`.
   making it available for all subsequent mounting operations
   system-wide. If loading failed, the entry is freed and the mounter falls
   back to any already-registered filesystem for that dostype.
-* If `FileSystem.resource` does not exist (common on KS 1.3), it is created.
+* `FileSystem.resource` is a Kickstart resident from V40 on, so it is taken as
+  given: if it is somehow absent, nothing is registered and nothing is looked
+  up. The mounter deliberately does not fabricate one — a second
+  `FileSysResource` on `SysBase->ResourceList` would shadow the real one for
+  everything that mounts later.
 
-### 4.3. Kickstart 1.3 Compatibility
+### 4.3. Autoboot Process
 
-To maintain compatibility with Kickstart 1.3, which lacks certain OS functions,
-the mounter includes its own implementations:
-* `W_CreateMsgPort` / `W_DeleteMsgPort`
-* `W_CreateIORequest` / `W_DeleteIORequest`
+Every node goes in through `AddBootNode()`, which covers both worlds: pre-V36's
+`AddDosNode()` is defined as `AddBootNode()` with a NULL `ConfigDev`, and a NULL
+`ConfigDev` is exactly what a non-bootable node wants.
 
-These functions use `AllocMem()` to create the necessary structures and manage
-signals manually, mimicking the behavior of their modern counterparts. For
-autobooting, it manually creates and inserts a `BootNode` into the
-`expansion.library`'s `MountList`, as `AddBootNode` is not fully featured on KS
-1.3.
+A `ConfigDev` is passed only when the mount happens before DOS exists and the
+partition is bootable — that is what makes the node `NT_BOOTNODE` and so visible
+to `strap`. If the caller has no autoconfig board behind the drive, the mounter
+creates a "fake" `ConfigDev`, which is what lets a USB or NVMe drive be booted
+from at all.
 
-### 4.4. Autoboot Process
-
-When a bootable partition is found and the mounter is operating in an autoboot
-context (i.e., a `configDev` is provided), it uses `AddBootNode()` instead of
-`AddDosNode()`. This function links the mountable partition directly to the
-autoconfig hardware board, signaling to the OS that this is a candidate for
-booting. If no `configDev` is provided, the mounter can create a "fake" one to
-enable autobooting from devices that are not on a standard autoconfig chain.
-
-### 4.5. Untrusted-Media Hardening
+### 4.4. Untrusted-Media Hardening
 
 Everything read from the medium is treated as untrusted (USB sticks arrive
 with corrupt or hostile metadata):
@@ -252,12 +245,14 @@ with corrupt or hostile metadata):
 
 The Mounter relies on the following standard AmigaOS libraries:
 
-* `exec.library` (v34+): For memory management, tasking, ports, and core system
+* `exec.library` (v40+): For memory management, tasking, ports, and core system
   functions.
-* `expansion.library` (v34+): For adding boot nodes and interacting with the
-  autoconfig process.
-* `dos.library` (v34+): For creating `DeviceNode` structures and adding them
-  to the DOS list.
+* `expansion.library` (v40+): For creating `DeviceNode` structures and adding
+  boot nodes.
+* `dos.library` (v40+), **optional**: only for the device/volume/assign name
+  collision check and the handler-file existence check. Opening it is allowed to
+  fail — that is precisely how the mounter detects that it is running before DOS
+  exists, which puts it on the boot path.
 
 Diagnostics: build with `-DMOUNTER_LOG` and provide
 `void mounter_log(const char *fmt, ...)` to receive all mounter output. Format

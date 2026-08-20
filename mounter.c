@@ -1,9 +1,9 @@
 
 // Generic autoboot/automount RDB parser and mounter.
-// - KS 1.3 support, including autoboot mode.
+// - AmigaOS 3.1 (V40) and up.
 // - 68000 compatible.
-// - Boot ROM and executable modes.
-// - Autoboot capable (Boot ROM mode only).
+// - Mounts both pre-DOS (from a ROM-resident driver, where the nodes it adds
+//   are what strap boots from) and post-DOS (hotplug).
 // - Full automount support
 // - Full RDB filesystem support.
 //
@@ -38,8 +38,6 @@
 #include <dos/doshunks.h>
 
 #include <string.h>
-#include <stdio.h>
-#include <stdbool.h>
 #include <stdint.h>
 
 #include <proto/exec.h>
@@ -51,10 +49,6 @@
 
 #ifndef SID_TYPE
 #define SID_TYPE 0x1F
-#endif
-
-#ifndef HD_WIDESCSI
-#define HD_WIDESCSI 8
 #endif
 
 // Two independent, host-configured logging tiers:
@@ -97,11 +91,6 @@ void mounter_log(const char *fmt, ...);
 #define MAX_RELOC_HUNKS    4096         // hunks in one loaded filesystem
 #define MAX_HUNK_LONGS     (16UL * 1024 * 1024 / sizeof(ULONG))  // 16 MB per hunk
 
-#if NO_CONFIGDEV
-extern UBYTE entrypoint, entrypoint_end;
-extern UBYTE bootblock, bootblock_end;
-#endif
-
 struct MountData
 {
 	struct ExecBase *SysBase;
@@ -120,9 +109,7 @@ struct MountData
 	UWORD lseghasword;
 
 	ULONG unitnum;
-	UBYTE zero[2];
 	BOOL wasLastDev;
-	BOOL wasLastLun;
 	BOOL slowSpinup;
 	int blocksize;
 	ULONG totalsectors;
@@ -203,98 +190,15 @@ struct __packed __attribute__((aligned(2))) SCSI_CD_TOC {
 };
 
 // Get Block size of unit
-BYTE GetGeometry(struct IOExtTD *req, struct DriveGeometry *geometry)
+static BYTE GetGeometry(struct MountData *md, struct IOExtTD *req, struct DriveGeometry *geometry)
 {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warray-bounds="
-	struct ExecBase *SysBase = *(struct ExecBase **)4UL;
-#pragma GCC diagnostic pop
+	struct ExecBase *SysBase = md->SysBase;
 
 	req->iotd_Req.io_Command = TD_GETGEOMETRY;
 	req->iotd_Req.io_Data    = geometry;
 	req->iotd_Req.io_Length  = sizeof(struct DriveGeometry);
 
 	return DoIO((struct IORequest *)req);
-}
-
-static void W_NewList(struct List *new_list)
-{
-    new_list->lh_Head = (struct Node *)&new_list->lh_Tail;
-    new_list->lh_Tail = 0;
-    new_list->lh_TailPred = (struct Node *)new_list;
-}
-
-// KS 1.3 compatibility functions
-APTR W_CreateIORequest(struct MsgPort *ioReplyPort, ULONG size, struct ExecBase *SysBase)
-{
-	struct IORequest *ret = NULL;
-	if(ioReplyPort == NULL)
-		return NULL;
-	ret = (struct IORequest*)AllocMem(size, MEMF_PUBLIC | MEMF_CLEAR);
-	if(ret != NULL)
-	{
-		ret->io_Message.mn_ReplyPort = ioReplyPort;
-		ret->io_Message.mn_Length = size;
-	}
-	return ret;
-}
-void W_DeleteIORequest(APTR iorequest, struct ExecBase *SysBase)
-{
-	if(iorequest != NULL) {
-		FreeMem(iorequest, ((struct Message*)iorequest)->mn_Length);
-	}
-}
-struct MsgPort *W_CreateMsgPort(struct ExecBase *SysBase)
-{
-	struct MsgPort *ret;
-	ret = (struct MsgPort*)AllocMem(sizeof(struct MsgPort), MEMF_PUBLIC | MEMF_CLEAR);
-	if(ret != NULL)
-	{
-		BYTE sb = AllocSignal(-1);
-		if (sb != -1)
-		{
-			ret->mp_Flags = PA_SIGNAL;
-			ret->mp_Node.ln_Type = NT_MSGPORT;
-			W_NewList(&ret->mp_MsgList);
-			ret->mp_SigBit = sb;
-			ret->mp_SigTask = FindTask(NULL);
-			return ret;
-		}
-		FreeMem(ret, sizeof(struct MsgPort));
-	}
-	return NULL;
-}
-void W_DeleteMsgPort(struct MsgPort *port, struct ExecBase *SysBase)
-{
-	if(port != NULL)
-	{
-		FreeSignal(port->mp_SigBit);
-		FreeMem(port, sizeof(struct MsgPort));
-	}
-}
-
-// Flush cache (Filesystem relocation)
-static void cacheclear(struct MountData *md)
-{
-	struct ExecBase *SysBase = md->SysBase;
-	if (SysBase->LibNode.lib_Version >= 37) {
-		CacheClearU();
-	}
-}
-
-// Simply memory copy.
-// Only used for few short copies, it does not need to be optimal.
-// Required because compiler built-in memcpy() can have
-// extra dependencies which will make boot rom build
-// impossible.
-static void copymem(void *dstp, void *srcp, UWORD size)
-{
-	UBYTE *dst = (UBYTE*)dstp;
-	UBYTE *src = (UBYTE*)srcp;
-	while (size != 0) {
-		*dst++ = *src++;
-		size--;
-	}
 }
 
 // Check block checksum
@@ -650,7 +554,7 @@ end:
 		}
 		firstProcessedHunk = NULL;
 	} else {
-		cacheclear(md);
+		CacheClearU();   // the relocated filesystem is about to be executed
 		dbg("reloc ok, first hunk 0x%08lx\n", (ULONG)firstProcessedHunk);
 	}
 
@@ -659,47 +563,19 @@ end:
 	return firstProcessedHunk;
 }
 
+static struct FileSysEntry *find_filesystem(ULONG id1, ULONG id2, struct ExecBase *SysBase);
+
 // Scan FileSystem.resource, create new if it is not found or existing entry has older version number.
 static struct FileSysEntry *FSHDProcess(struct FileSysHeaderBlock *fshb, ULONG dostype, ULONG version, BOOL newOnly, struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
 	struct FileSysEntry *result_fse = NULL;
-	const UBYTE *creator = md->creator ? md->creator : md->zero;
-	const char resourceName[] = "FileSystem.resource";
+	const UBYTE *creator = md->creator ? md->creator : (const UBYTE *)"";
 
 	Forbid();
 	struct FileSysResource *fsr = OpenResource(FSRNAME);
-	if (!fsr) {
-		// FileSystem.resource didn't exist (KS 1.3), create it.
-		fsr = AllocMem(sizeof(struct FileSysResource) + strlen(resourceName) + 1 + strlen((const char *)creator) + 1, MEMF_PUBLIC | MEMF_CLEAR);
-		if (fsr) {
-			char *FsResName  = (char *)(fsr + 1);
-			char *CreatorStr = (char *)FsResName + (strlen(resourceName) + 1);
-			W_NewList(&fsr->fsr_FileSysEntries);
-			fsr->fsr_Node.ln_Type = NT_RESOURCE;
-			strcpy(FsResName, resourceName);
-			fsr->fsr_Node.ln_Name = FsResName;
-			strcpy(CreatorStr, (const char *)creator);
-			fsr->fsr_Creator = CreatorStr;
-			AddTail(&SysBase->ResourceList, &fsr->fsr_Node);
-		}
-		dbg("FileSystem.resource created 0x%08lx\n", (ULONG)fsr);
-	}
-
 	if (fsr) {
-		struct Node *node;
-		struct FileSysEntry *found_existing_fse = NULL;
-
-		// Correctly iterate through the list to find if an entry for 'dostype' already exists
-		for (node = fsr->fsr_FileSysEntries.lh_Head;
-			 node->ln_Succ != NULL; // Standard AmigaOS list traversal: loop while node is not the tail sentinel
-			 node = node->ln_Succ) {
-			struct FileSysEntry *current_entry = (struct FileSysEntry *)node;
-			if (current_entry->fse_DosType == dostype) {
-				found_existing_fse = current_entry; // Found a match by DosType
-				break; // Process this first match
-			}
-		}
+		struct FileSysEntry *found_existing_fse = find_filesystem(dostype, 0, SysBase);
 
 		if (found_existing_fse) {
 			// An entry with the same DosType was found
@@ -781,7 +657,7 @@ static BOOL FSHDAdd(struct FileSysEntry *fse, struct MountData *md)
 		Permit();
 	}
 	// Match the allocation in FSHDProcess: struct + creator string + NUL.
-	const UBYTE *creator = md->creator ? md->creator : md->zero;
+	const UBYTE *creator = md->creator ? md->creator : (const UBYTE *)"";
 	dbg("FileSysEntry 0x%08lx freed, dostype %08lx\n", (ULONG)fse, fse->fse_DosType);
 	FreeMem(fse, sizeof(struct FileSysEntry) + strlen((const char *)creator) + 1);
 	return FALSE;
@@ -836,34 +712,26 @@ static struct FileSysEntry *ParseFSHD(ULONG block, ULONG dostype, struct MountDa
 	return fse;
 }
 
-#if NO_CONFIGDEV
-// Create fake ConfigDev and DiagArea to support autoboot without requiring real autoconfig device.
+// Give a pre-DOS mount a ConfigDev, without which its BootNodes are not bootable.
+//
+// AddBootNode() branches on the ConfigDev pointer — expansion.doc: "Autoboot from
+// an expansion card before DOS is running requires the card's ConfigDev
+// structure.  Pass a NULL ConfigDev pointer to create a non-bootable node."  Only
+// a bootable node is NT_BOOTNODE, and only those are candidates for the boot
+// scan.  So a caller that mounts before DOS exists — a boot ROM, which is the
+// only way to get a BootNode at all — has to supply one even when there is no
+// real autoconfig board behind the drive.
+//
+// Deliberately never freed — the BootNode's LN_NAME points at it for the life of
+// the machine.  It is not added to the expansion ConfigDev list either, so nothing
+// else can trip over it.
 static void CreateFakeConfigDev(struct MountData *md)
 {
-	struct ExecBase *SysBase = md->SysBase;
 	struct ExpansionBase *ExpansionBase = md->ExpansionBase;
-	struct ConfigDev *configDev;
 
-	configDev = AllocConfigDev();
-	if (configDev) {
-		configDev->cd_BoardAddr = (void*)&entrypoint;
-		configDev->cd_BoardSize = (UBYTE*)&entrypoint_end - (UBYTE*)&entrypoint;
-		configDev->cd_Rom.er_Type = ERTF_DIAGVALID;
-		ULONG bbSize = &bootblock_end - &bootblock;
-		ULONG daSize = sizeof(struct DiagArea) + bbSize;
-		struct DiagArea *diagArea = AllocMem(daSize, MEMF_CLEAR | MEMF_PUBLIC);
-		if (diagArea) {
-			diagArea->da_Config = DAC_CONFIGTIME;
-			diagArea->da_BootPoint = sizeof(struct DiagArea);
-			diagArea->da_Size = (UWORD)daSize;
-			copymem(diagArea + 1, &bootblock, bbSize);
-			memcpy(&configDev->cd_Rom.er_Reserved0c, &diagArea, sizeof(ULONG));
-			cacheclear(md);
-		}
-		md->configDev = configDev;
-	}
+	md->configDev = AllocConfigDev();
+	dbg("Fake ConfigDev for pre-DOS boot: 0x%08lx\n", (ULONG)md->configDev);
 }
-#endif
 
 struct ParameterPacket
 {
@@ -903,10 +771,10 @@ static BOOL CompareBSTRNoCase(const UBYTE *src1, const UBYTE *src2)
 }
 
 // Check for duplicate device names
-static bool CheckDevName(struct MountData *md, UBYTE *bname)
+static BOOL CheckDevName(struct MountData *md, UBYTE *bname)
 {
 	struct ExecBase *SysBase = md->SysBase;
-	bool found = false;
+	BOOL found = FALSE;
 
 	Forbid();
 	struct BootNode *bn;
@@ -917,19 +785,20 @@ static bool CheckDevName(struct MountData *md, UBYTE *bname)
 		struct DeviceNode *dn = bn->bn_DeviceNode;
 		const UBYTE *bname2 = BADDR(dn->dn_Name);
 		if (CompareBSTRNoCase(bname, bname2)) {
-			found = true;
+			found = TRUE;
 		}
 	}
 
 	Permit();
 
 	// Post-boot mounts go straight to the DOS lists, not eb_MountList — check
-	// those too (devices, volumes and assigns all claim the name).
-	if (!found && md->DOSBase && md->DOSBase->dl_lib.lib_Version >= 36) {
+	// those too (devices, volumes and assigns all claim the name). No DOSBase
+	// means we are running before DOS, where eb_MountList is the whole picture.
+	if (!found && md->DOSBase) {
 		struct DosLibrary *DOSBase = md->DOSBase;
 		struct DosList *dl = LockDosList(LDF_ALL | LDF_READ);
 		if (FindDosEntry(dl, (STRPTR)(bname + 1), LDF_ALL)) {
-			found = true;
+			found = TRUE;
 		}
 		UnLockDosList(LDF_ALL | LDF_READ);
 	}
@@ -975,60 +844,23 @@ static void CheckAndFixDevName(struct MountData *md, UBYTE *bname, int cap)
 	}
 }
 
-// Add DeviceNode to Expansion MountList.
-static void AddNode(struct PartitionBlock *part, struct ParameterPacket *pp, struct DeviceNode *dn, UBYTE *name, struct MountData *md)
+// Add a DeviceNode to the system.
+//
+// A BootNode is only NT_BOOTNODE — and so only reachable by strap — when a
+// ConfigDev is supplied, which is what makes this the pre-DOS boot path (see
+// CreateFakeConfigDev). Post-DOS, or for anything not meant to be booted, a
+// NULL ConfigDev is exactly what the pre-V36 AddDosNode() meant: expansion.doc
+// calls it "the old (pre V36) function that works just like AddBootNode()".
+// So one call covers both worlds.
+static void AddMountNode(struct MountData *md, LONG bootPri, struct DeviceNode *dn)
 {
-	struct ExecBase *SysBase = md->SysBase;
 	struct ExpansionBase *ExpansionBase = md->ExpansionBase;
-	struct DosLibrary *DOSBase = md->DOSBase;
+	struct ConfigDev *cd = NULL;
 
-	LONG bootPri = (part->pb_Flags & PBFF_BOOTABLE) ? pp->de.de_BootPri : -128;
-	if (md->flags & MSF_NO_BOOT)
-		bootPri = -128;
-	if (ExpansionBase->LibNode.lib_Version >= 37) {
-		// KS 2.0+
-		if (!md->DOSBase && bootPri > -128) {
-			dbg("KS20+ Mounting as bootable: pri %08lx\n", bootPri);
-			AddBootNode(bootPri, ADNF_STARTPROC, dn, md->configDev);
-		} else {
-			dbg("KS20+: Mounting as non-bootable\n");
-			AddDosNode(bootPri, ADNF_STARTPROC, dn);
-		}
-	} else {
-		// KS 1.3
-		if (!md->DOSBase && bootPri > -128) {
-			dbg("KS13 Mounting as bootable: pri %08lx\n", bootPri);
-			// Create and insert bootnode manually.
-			struct BootNode *bn = AllocMem(sizeof(struct BootNode), MEMF_CLEAR | MEMF_PUBLIC);
-			if (bn) {
-				bn->bn_Node.ln_Type = NT_BOOTNODE;
-				bn->bn_Node.ln_Pri = (BYTE)bootPri;
-				bn->bn_Node.ln_Name = (UBYTE*)md->configDev;
-				bn->bn_DeviceNode = dn;
-				Forbid();
-				Enqueue(&md->ExpansionBase->MountList, &bn->bn_Node);
-				Permit();
-			}
-		} else {
-			dbg("KS13: Mounting as non-bootable\n");
-			AddDosNode(bootPri, 0, dn);
-			if (md->DOSBase) {
-				// KS 1.3 ADNF_STARTPROC is not supported; start the filesystem
-				// process via DeviceProc(). Build "<name>:" in a local buffer —
-				// appending ':' into 'name' (a pointer into the 32-byte
-				// pb_DriveName) would overflow the field for a full-length name.
-				UBYTE devpath[36];
-				UWORD len = strlen(name);
-				if (len > (int)sizeof(devpath) - 2)
-					len = (int)sizeof(devpath) - 2;
-				memcpy(devpath, name, len);
-				devpath[len++] = ':';
-				devpath[len] = 0;
-				void * __attribute__((unused)) mp = DeviceProc(devpath);
-				dbg("DeviceProc() returned 0x%08lx\n", (ULONG)mp);
-			}
-		}
-	}
+	if (!md->DOSBase && bootPri > -128 && !(md->flags & MSF_NO_BOOT))
+		cd = md->configDev;
+	dbg("Mounting %s: pri %ld\n", cd ? "bootable" : "non-bootable", bootPri);
+	AddBootNode(bootPri, ADNF_STARTPROC, dn, cd);
 }
 
 static void ProcessPatchFlags(struct DeviceNode *dn, struct FileSysEntry *fse)
@@ -1054,8 +886,6 @@ static void ProcessPatchFlags(struct DeviceNode *dn, struct FileSysEntry *fse)
 	if (patchFlags & 0x0100)
 		dn->dn_GlobalVec = fse->fse_GlobalVec;
 }
-
-static struct FileSysEntry *find_filesystem(ULONG id1, ULONG id2, struct ExecBase *SysBase);
 
 // TRUE if the recipe can resolve to a working filesystem: the dostype is
 // registered in FileSystem.resource, or a handler file is given and can be
@@ -1095,11 +925,17 @@ static BOOL FileSystemAvailable(struct MountData *md, const struct MountFS *fs)
 // must not lose to a stale controller-ROM filesystem sitting on their dostype
 // (what ForceLoad=1 does in a mountlist), keeping the resource entry as the
 // fallback for machines that carry the handler in ROM and nowhere else.
+//
+// Not pre-DOS, though. There a handler path is a promise nobody can keep: the
+// node would carry "L:ODFileSystem" with no DOS to load it, so strap cannot boot
+// the volume however good the handler would have been. The resource entry is the
+// only thing that can work before DOS exists, so it wins there — which is the
+// whole point of putting a filesystem in the Kickstart in the first place.
 static BOOL SetupFileSystem(struct MountData *md, struct DeviceNode *dn, const struct MountFS *fs)
 {
 	struct ExecBase *SysBase = md->SysBase;
 	struct FileSysEntry *fse = find_filesystem(fs->dosType, 0, SysBase);
-	BOOL forceLoad = fs->handler && (fs->fsFlags & MOUNTFS_FORCELOAD);
+	BOOL forceLoad = md->DOSBase && fs->handler && (fs->fsFlags & MOUNTFS_FORCELOAD);
 
 	if (fse && !forceLoad) {
 		ProcessPatchFlags(dn, fse);
@@ -1119,17 +955,6 @@ static BOOL SetupFileSystem(struct MountData *md, struct DeviceNode *dn, const s
 		return TRUE;
 	}
 	return FALSE;
-}
-
-// Add a legacy/CD DeviceNode: bootable only pre-DOS, same rule as AddNode().
-static void AddLegacyNode(struct MountData *md, LONG bootPri, struct DeviceNode *dn)
-{
-	struct ExpansionBase *ExpansionBase = md->ExpansionBase;
-	if (!md->DOSBase && bootPri > -128 && !(md->flags & MSF_NO_BOOT)) {
-		AddBootNode(bootPri, ADNF_STARTPROC, dn, md->configDev);
-	} else {
-		AddDosNode(bootPri, ADNF_STARTPROC, dn);
-	}
 }
 
 // Parse PART block, mount drive. Returns the next PART block in the chain;
@@ -1157,7 +982,7 @@ static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct Mount
 			ULONG tablesize = part->pb_Environment[0];
 			if (tablesize > sizeof(struct DosEnvec) / sizeof(ULONG) - 1)
 				tablesize = sizeof(struct DosEnvec) / sizeof(ULONG) - 1;
-			copymem(&pp->de, &part->pb_Environment, (tablesize + 1) * sizeof(ULONG));
+			CopyMem(&part->pb_Environment, &pp->de, (tablesize + 1) * sizeof(ULONG));
 			pp->de.de_TableSize = tablesize;
 			struct FileSysEntry *fse = ParseFSHD(filesysblock, pp->de.de_DosType, md);
 			pp->execname = md->devicename;
@@ -1179,12 +1004,10 @@ static ULONG ParsePART(UBYTE *buf, ULONG block, ULONG filesysblock, struct Mount
 					ProcessPatchFlags(dn, fse);
 				}
 				dbg("Mounting partition\n");
-#if NO_CONFIGDEV
-				if (!md->configDev && !md->DOSBase) {
-					CreateFakeConfigDev(md);
-				}
-#endif
-				AddNode(part, pp, dn, part->pb_DriveName + 1, md);
+				LONG bootPri = (part->pb_Flags & PBFF_BOOTABLE) ? pp->de.de_BootPri : -128;
+				if (md->flags & MSF_NO_BOOT)
+					bootPri = -128;
+				AddMountNode(md, bootPri, dn);
 				(*mounted)++;
 			} else {
 				dbg("Device node creation failed\n");
@@ -1214,7 +1037,6 @@ static LONG ParseRDSK(UBYTE *buf, struct MountData *md)
 	}
 
 	md->wasLastDev = (flags & RDBFF_LAST) != 0;
-	md->wasLastLun = (flags & RDBFF_LASTLUN) != 0;
 
 	return mounted;
 }
@@ -1261,12 +1083,9 @@ static struct FileSysEntry *find_filesystem(ULONG id1, ULONG id2, struct ExecBas
 }
 
 // Check if there is a disc inserted
-static bool UnitIsReady(struct IOStdReq *req)
+static BOOL UnitIsReady(struct MountData *md, struct IOStdReq *req)
 {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warray-bounds="
-	struct ExecBase *SysBase = *(struct ExecBase **)4UL;
-#pragma GCC diagnostic pop
+	struct ExecBase *SysBase = md->SysBase;
 
 	BYTE err;
 
@@ -1282,11 +1101,11 @@ static bool UnitIsReady(struct IOStdReq *req)
 	err = DoIO((struct IORequest *)req);
 
 	// Some devices/units don't support this - assume that it is ready
-	if (err == IOERR_NOCMD) return true;
+	if (err == IOERR_NOCMD) return TRUE;
 
-	if (err == 0 && req->io_Actual == 0) return true;
+	if (err == 0 && req->io_Actual == 0) return TRUE;
 
-	return false;
+	return FALSE;
 }
 
 
@@ -1296,12 +1115,9 @@ static bool UnitIsReady(struct IOStdReq *req)
 #define CDDISC_AUDIO   2	// track 1 is an audio track
 
 // Classify the disc by reading the TOC and checking track 1's data-track bit.
-static int ClassifyCD(struct IOStdReq *ior)
+static int ClassifyCD(struct MountData *md, struct IOStdReq *ior)
 {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Warray-bounds="
-	struct ExecBase *SysBase = *(struct ExecBase **)4UL;
-#pragma GCC diagnostic pop
+	struct ExecBase *SysBase = md->SysBase;
 	int ret = CDDISC_UNKNOWN;
 
 	BYTE err;
@@ -1370,8 +1186,9 @@ static int ClassifyCD(struct IOStdReq *ior)
 // System ID "CDTV" or "AMIGA BOOT"? Identifying the disc's format is the CD
 // filesystem's job, not ours.
 // Returns: one of the PVD_* values above.
-static LONG CheckPVD(struct IOStdReq *ior, struct ExecBase *SysBase)
+static LONG CheckPVD(struct MountData *md, struct IOStdReq *ior)
 {
+	struct ExecBase *SysBase = md->SysBase;
 	const char sys_id_1[] = "CDTV";
 	const char sys_id_2[] = "AMIGA BOOT";
 	const char iso_id[]   = "CD001";
@@ -1463,7 +1280,7 @@ static LONG mount_recipe(struct MountData *md, const struct MountFS *fs,
 		printf("Could not load filesystem\n");
 		return -1;
 	}
-	AddLegacyNode(md, bootPri, node);
+	AddMountNode(md, bootPri, node);
 	return 1;
 }
 
@@ -1476,16 +1293,15 @@ static LONG mount_recipe(struct MountData *md, const struct MountFS *fs,
 // refused, which is all a legacy CDFileSystem can do.
 static LONG ScanCDROM(struct MountData *md)
 {
-	struct ExecBase *SysBase = md->SysBase;
 	const struct MountFS *fs = md->cdFS;
 	struct MountFS classicCD;
 	UBYTE dosName[DEVNAME_BUFSIZE];
 	LONG bootPri = -1; // May not be a boot disk, lower priority than HDD
 
-	if (!UnitIsReady((struct IOStdReq *)md->request))
+	if (!UnitIsReady(md, (struct IOStdReq *)md->request))
 		return -1;
 
-	int disc = ClassifyCD((struct IOStdReq *)md->request);
+	int disc = ClassifyCD(md, (struct IOStdReq *)md->request);
 
 	// Some enclosures answer READ TOC poorly for DVD/BD media - which is
 	// exactly the media UDF lives on. Give a self-identifying filesystem the
@@ -1497,7 +1313,7 @@ static LONG ScanCDROM(struct MountData *md)
 	case CDDISC_DATA:
 	{
 		// "CDTV" or "AMIGA BOOT"?
-		LONG pvd = CheckPVD((struct IOStdReq *)md->request,SysBase);
+		LONG pvd = CheckPVD(md, (struct IOStdReq *)md->request);
 
 		if (pvd < PVD_DATA) {
 			// No ISO9660 PVD. RDB CD?
@@ -1970,7 +1786,7 @@ static LONG ProbeUnit(struct MountData *md, struct MountStruct *ms, ULONG unitNu
 		dbg("OpenDevice(%s,%ld) failed: %ld\n", ms->deviceName, unitNum, (BYTE)err);
 		return -1;
 	}
-	if (GetGeometry(request, &geom) == 0) {
+	if (GetGeometry(md, request, &geom) == 0) {
 		if (geom.dg_SectorSize < 256 || geom.dg_SectorSize > MAX_BLOCKSIZE) {
 			printf("Unsupported sector size %lu.\n", geom.dg_SectorSize);
 			goto out;
@@ -2008,37 +1824,6 @@ out:
 	DoIO((struct IORequest*)request);
 	CloseDevice((struct IORequest*)request);
 	return ret;
-}
-
-// Full SCSI-style scan: every target 0-7 (skipping the host ID), optionally each
-// target's LUNs, honoring RDBFF_LASTLUN / RDBFF_LAST. Accumulates the mounted
-// count into *total and sets *recognized if any unit held recognizable media.
-static void ScanAllUnits(struct MountData *md, struct MountStruct *ms,
-                         struct IOExtTD *request, LONG *total, BOOL *recognized)
-{
-	for (ULONG target = 0; target < 8; target++) {
-		if (target == ms->hostId)   // skip the host controller ID
-			continue;
-		ULONG lun = 0;
-		for (;;) {
-			ULONG unitNum;
-			if (target > 7 || lun > 7)
-				unitNum = lun * 10 * 1000 + target * 10 + HD_WIDESCSI;  // Phase V wide SCSI
-			else
-				unitNum = target + lun * 10;                            // traditional scheme
-			LONG r = ProbeUnit(md, ms, unitNum, request);
-			if (r >= 0) {
-				*recognized = TRUE;
-				*total += r;
-			}
-			if (!(ms->luns && lun++ < 8 && !md->wasLastLun))
-				break;
-		}
-		if (md->wasLastDev && !ms->ignoreLast) {
-			dbg("RDBFF_LAST exit\n");
-			break;
-		}
-	}
 }
 
 // Explicit unit(s): a single unit number (< 0x100), else a pointer to a
@@ -2096,7 +1881,12 @@ LONG MountDrive(struct MountStruct *ms)
 
 	dbg("Starting..\n");
 
-	ExpansionBase = (struct ExpansionBase*)OpenLibrary("expansion.library", 34);
+	if (ms->unitNum == NULL) {
+		printf("MountDrive: no unit given\n");
+		return -1;
+	}
+
+	ExpansionBase = (struct ExpansionBase*)OpenLibrary("expansion.library", 40);
 	if (!ExpansionBase)
 		goto cleanup;
 
@@ -2104,7 +1894,7 @@ LONG MountDrive(struct MountStruct *ms)
 	if (!md)
 		goto cleanup;
 
-	md->DOSBase = (struct DosLibrary*)OpenLibrary("dos.library", 34);
+	md->DOSBase = (struct DosLibrary*)OpenLibrary("dos.library", 40);
 	md->SysBase = SysBase;
 	md->ExpansionBase = ExpansionBase;
 	dbg("SysBase=0x%08lx ExpansionBase=0x%08lx DosBase=0x%08lx\n", (ULONG)md->SysBase, (ULONG)md->ExpansionBase, (ULONG)md->DOSBase);
@@ -2112,30 +1902,35 @@ LONG MountDrive(struct MountStruct *ms)
 	md->creator = ms->creatorName;
 	md->slowSpinup = ms->slowSpinup;
 	md->flags = ms->flags;
+
+	// Before DOS exists every node we add goes on the boot list, and that needs a
+	// ConfigDev to be an NT_BOOTNODE at all (see CreateFakeConfigDev).  Done here,
+	// once per mount, so every AddMountNode() is covered — callers that have a
+	// real board still pass their own in ms->configDev.
+	if (!md->configDev && !md->DOSBase && !(md->flags & MSF_NO_BOOT))
+		CreateFakeConfigDev(md);
+
 	md->fatFS = ms->fatFS;
 	md->ntfsFS = ms->ntfsFS;
 	md->exfatFS = ms->exfatFS;
 	md->cdFS = ms->cdFS;
 	md->dmaAlign = ms->dmaAlign;
 
-	port = W_CreateMsgPort(SysBase);
+	port = CreateMsgPort();
 	if (!port)
 		goto cleanup;
 
-	request = (struct IOExtTD*)W_CreateIORequest(port, sizeof(struct IOExtTD), SysBase);
+	request = (struct IOExtTD*)CreateIORequest(port, sizeof(struct IOExtTD));
 	if (!request)
 		goto cleanup;
 
-	if (ms->unitNum == NULL)
-		ScanAllUnits(md, ms, request, &total, &recognized);
-	else
-		ScanUnitList(md, ms, request, &total, &recognized);
+	ScanUnitList(md, ms, request, &total, &recognized);
 
 cleanup:
 	if (request)
-		W_DeleteIORequest(request, SysBase);
+		DeleteIORequest(request);
 	if (port)
-		W_DeleteMsgPort(port, SysBase);
+		DeleteMsgPort(port);
 	if (md) {
 		if (md->DOSBase)
 			CloseLibrary(&md->DOSBase->dl_lib);

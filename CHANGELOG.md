@@ -1,10 +1,15 @@
 # Changelog — poseidon-fixes fork
 
 All changes are relative to the upstream a4091-software mounter (`main`).
+
+**The fork requires AmigaOS 3.1 (V40) and up** — upstream's Kickstart 1.3/2.x
+fallbacks are gone (see Removed).
+
 `struct MountStruct` and `struct MountFS` both grew, but zero-filling the new
-fields keeps the classic behavior; existing callers only need to drop `cdBoot`
-(see Removed) and rebuild. Both structs are caller-allocated and every field is
-read, so caller and mounter must always be built from the same header.
+fields keeps the classic behavior; existing callers need to drop `cdBoot`,
+`luns` and `hostId` (see Removed) and rebuild. Both structs are
+caller-allocated and every field is read, so caller and mounter must always be
+built from the same header.
 
 ## New
 
@@ -94,11 +99,11 @@ read, so caller and mounter must always be built from the same header.
   - GPT gated by protective MBR entry and validated header (position, size, CRC32)
   - honors `size_of_entry`, caps at 128 entries, skips partitions beyond 2^32
     blocks instead of truncating
-- **Boot-node rule unified**: legacy/CD paths follow the RDB rule —
-  `AddBootNode()` only pre-DOS for bootable partitions, `AddDosNode()`
-  otherwise.
+- **Boot-node rule unified**: legacy/CD paths follow the RDB rule — a
+  `ConfigDev` is passed only pre-DOS for bootable partitions, NULL otherwise.
+  Both paths now go through one `AddMountNode()` (see Removed).
 - **Reads past 4 GB use `TD_READ64`** (32-bit `CMD_READ` offsets stay for
-  smaller disks, keeping KS1.3-era devices working).
+  smaller disks; not every device implements TD64).
 - **Sector sizes 256–4096 supported** (buffers sized for 4096); anything else
   is rejected per unit instead of overflowing.
 - **Hardened against corrupt/hostile media**:
@@ -109,8 +114,38 @@ read, so caller and mounter must always be built from the same header.
 
 ## Removed
 
+- **Pre-3.1 Kickstart support. The fork now requires AmigaOS 3.1 (V40) and up**,
+  and uses the V36+ OS API unconditionally. Upstream still supports KS 1.3; this
+  fork's consumers cannot run below V40, so the legacy paths were untestable
+  code sitting in a pre-DOS boot path. Gone with it:
+  - the `W_CreateMsgPort`/`W_DeleteMsgPort`/`W_CreateIORequest`/
+    `W_DeleteIORequest` shims and the private `W_NewList` — exec's own V36
+    `CreateMsgPort()`/`DeleteMsgPort()`/`CreateIORequest()`/`DeleteIORequest()`
+    are used instead. The four `W_*` declarations are out of `mounter.h`.
+  - the `lib_Version >= 37` gate around `CacheClearU()` and its `cacheclear()`
+    wrapper
+  - the `lib_Version >= 36` gate on the DOS device/volume/assign name check
+  - the KS 1.3 arm of `AddNode()` — hand-built `BootNode` + `Enqueue()`, and
+    `AddDosNode()` + `DeviceProc()` standing in for `ADNF_STARTPROC`.
+    `AddNode()`/`AddLegacyNode()` are now one `AddMountNode()` over
+    `AddBootNode()`, which is what `AddDosNode()` is defined to be.
+  - fabricating `FileSystem.resource` when absent — it is a Kickstart resident
+    at priority 80 from V40 on, and a second one on `SysBase->ResourceList`
+    would shadow the real one
+  - `copymem()`, a hand-rolled byte copy carrying an a4091 boot-ROM link
+    constraint; `CopyMem()` is used instead
+  - `expansion.library`/`dos.library` are opened with version 40 (the dos open
+    stays optional — failing it is how pre-DOS is detected)
+
+  68000 compatibility is unaffected and stays: the odd-address `HUNK_RELOC32`
+  branch and the byte-wise big-endian reassembly are a CPU floor, not an OS one.
+
+- **`ScanAllUnits()` and the `luns` / `hostId` `MountStruct` fields**: the blind
+  scan of SCSI targets 0–7 × LUNs, with the Phase V wide-SCSI unit encoding.
+  Unreachable in this fork — neither consumer is a SCSI host and both always
+  pass a unit-number array. `unitNum` is now **required**; NULL returns -1.
 - **`cdBoot` field**: replaced by `MSF_NO_CD` (gated all CD mounting, not just
-  booting); callers must switch; field slot is now `pad` + `flags`
+  booting); callers must switch; field slot is now `flags`
 - **`DISKLABELS` compile-time gate**: MBR/GPT/superfloppy support always built;
   use `MSF_NO_LEGACY` at runtime instead
 - **`ndkcompat.h`**: gone; format strings use literal `%ld`/`%lu`/`%lx`
