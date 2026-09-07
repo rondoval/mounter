@@ -11,6 +11,15 @@ not a diff you can apply.
 **The fork requires AmigaOS 3.1 (V40) and up** — upstream's Kickstart 1.3/2.x
 fallbacks are gone (see Removed).
 
+## 2026-09 — pre-DOS nodes get a real boot point
+
+- **Bootable, not merely listed.** `NT_BOOTNODE` got a pre-DOS node into the boot
+  menu but never into the boot: `strap` needs a boot block or an autoboot
+  `DiagArea`, and a medium with no Amiga boot block has only the latter. The fake
+  `ConfigDev` now carries `ERTF_DIAGVALID` and a `DiagArea` pointing at
+  `bootpoint.c` (new file), the `FindResident("dos.library")` → `jmp rt_Init` stub
+  the RKRM prescribes.
+
 ## 2026-08 — restructure
 
 One mount path, four files, one naming convention. Behaviour is unchanged except

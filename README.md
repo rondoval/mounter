@@ -262,8 +262,7 @@ Every node goes in through `AddBootNode()`, which covers both worlds: pre-V36's
 A `ConfigDev` is passed only when the mount happens before DOS exists and the
 partition is bootable — that is what makes the node `NT_BOOTNODE` and so visible
 to `strap`. If the caller has no autoconfig board behind the drive, the mounter
-creates a "fake" `ConfigDev`, which is what lets a USB or NVMe drive be booted
-from at all.
+creates a "fake" `ConfigDev`.
 
 ### 4.4. Untrusted-Media Hardening
 

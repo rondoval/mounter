@@ -227,14 +227,20 @@ struct FileSysEntry *mnt_find_filesystem(ULONG id1, ULONG id2, struct ExecBase *
 // real autoconfig board behind the drive.
 //
 // Deliberately never freed — the BootNode's LN_NAME points at it for the life of
-// the machine.  It is not added to the expansion ConfigDev list either, so nothing
-// else can trip over it.
+// the machine.  AllocConfigDev() without AddConfigDev() also keeps it off
+// expansion's board list, where romboot scans diag areas for romtags.
 static void make_fake_configdev(struct MountData *md)
 {
 	struct ExpansionBase *ExpansionBase = md->ExpansionBase;
+	extern const struct DiagArea psd_diag_area;   // mounter/bootpoint.c
 
 	md->configDev = AllocConfigDev();
-	dbg("Fake ConfigDev for pre-DOS boot: 0x%08lx\n", (ULONG)md->configDev);
+	if (md->configDev) {
+		md->configDev->cd_Rom.er_Type |= ERTF_DIAGVALID;
+		*(APTR *)&md->configDev->cd_Rom.er_Reserved0c = (APTR)&psd_diag_area;
+	}
+	dbg("Fake ConfigDev for pre-DOS boot: 0x%08lx (DiagArea 0x%08lx)\n",
+	    (ULONG)md->configDev, (ULONG)&psd_diag_area);
 }
 
 static UBYTE to_upper(UBYTE c)
