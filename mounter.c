@@ -599,6 +599,8 @@ void mnt_envec_from_recipe(struct MountData *md, struct DosEnvec *de,
 // DOS name and force that later, working mount into a renamed duplicate.
 BOOL mnt_resolve_fs(struct MountData *md, const struct MountFS *fs, ULONG lowCyl)
 {
+	(void)lowCyl; // In case we turned debugging off.
+
 	if (is_fs_available(md, fs))
 		return TRUE;
 
@@ -696,8 +698,9 @@ static LONG probe_unit(struct MountData *md, const struct MountStruct *ms, ULONG
 		case DG_OPTICAL_DISK:
 			if (!(md->flags & MSF_NO_CD))
 				recognized = mnt_scan_cd(md);
-			else
+			else {
 				printf("CDROM mounting disabled.\n");
+			}
 			break;
 		case DG_DIRECT_ACCESS:
 			if (!(md->flags & MSF_NO_RDB))

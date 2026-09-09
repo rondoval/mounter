@@ -63,6 +63,8 @@ static int classify_vbr(const UBYTE *b, ULONG blocksize)
 // Amiga filesystem in an MBR or GPT slot, this assumption has to come back.
 static void register_legacy(struct MountData *md, UBYTE type, ULONG pstart, ULONG plen)
 {
+	(void)type; // In case we turned debugging off.
+
 	const struct MountFS *fs = NULL;
 	ULONG pend = pstart + plen - 1;
 
@@ -158,9 +160,10 @@ static void parse_ebr(struct MountData *md, ULONG base)
 			break;
 		ebr = base + __bswap32(link->f_lba);
 	}
-	if (n == MAX_EXTENDED_PARTITIONS)
+	if (n == MAX_EXTENDED_PARTITIONS) {
 		printf("Warning: Extended partition limit (%ld) reached\n",
 		       (LONG)MAX_EXTENDED_PARTITIONS);
+	}
 	mnt_sector_drop(md, buf);
 }
 
