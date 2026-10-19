@@ -1,4 +1,7 @@
-# Changelog — poseidon-fixes fork
+# Changelog — neptune-fixes fork
+
+The branch was called `poseidon-fixes` until 2026-10, when the USB stack it serves was
+renamed from "Poseidon for AmigaOS" to Neptune.
 
 **This fork no longer tracks upstream.** It began as the a4091-software mounter
 (`main`) and stayed mergeable with it for a long while, but the 2026-08 restructure

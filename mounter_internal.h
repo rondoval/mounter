@@ -63,7 +63,7 @@
 //    MOUNTER_TRACE=1 from the build to enable it; off by default. Still
 //    compiles away if MOUNTER_LOG is undefined, since dbg() -> printf().
 #if defined(MOUNTER_LOG)
-// Host-provided log sink (e.g. the Poseidon debug backend). It may format with
+// Host-provided log sink (e.g. the Neptune debug backend). It may format with
 // exec RawDoFmt, so format strings here use %l-sized conversions only (no %p).
 void mounter_log(const char *fmt, ...);
 #define printf mounter_log

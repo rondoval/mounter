@@ -3,8 +3,8 @@
 Generic autoboot / automount partition parser and mounter: RDB, MBR, GPT,
 superfloppy and data CDs.
 
-Originally the mounter code from `a4091.device`; this is the `poseidon-fixes`
-fork, which stopped tracking upstream and has since been restructured. See
+Originally the mounter code from `a4091.device`; this is the `neptune-fixes`
+fork (called `poseidon-fixes` until 2026-10), which stopped tracking upstream and has since been restructured. See
 CHANGELOG.md for its history.
 
 ## 1. Introduction
@@ -12,7 +12,7 @@ CHANGELOG.md for its history.
 This Mounter software is a generic, autoboot/automount Rigid Disk Block (RDB)
 parser and mounter for AmigaOS. Originally developed by Toni Wilen and extended
 by Stefan Reinauer and Matt Harlum, it is used by the `a4091.device` and
-`lide.device` drivers; this fork additionally drives the Poseidon USB stack's
+`lide.device` drivers; this fork additionally drives the Neptune USB stack's
 `massstorage.class` (hotplugged media). It is engineered to be a robust and
 highly compatible solution for device drivers that need to mount partitions
 and filesystems — at boot time or at hotplug time.
@@ -33,7 +33,7 @@ loader), `mounter_legacy.c` (MBR, EBR chains, GPT, superfloppy) and
 
 ## 2. Core Features
 
-* **OS Requirement**: AmigaOS 3.1 (V40) and up. The `poseidon-fixes` fork
+* **OS Requirement**: AmigaOS 3.1 (V40) and up. The `neptune-fixes` fork
   dropped upstream's Kickstart 1.3/2.x fallbacks and uses the V36+ OS API
   unconditionally.
 * **CPU Compatibility**: Compatible with the Motorola 68000 processor, ensuring
