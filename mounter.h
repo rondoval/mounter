@@ -115,9 +115,10 @@ struct MountStruct
 	ULONG flags;
 	// Recommended DMA buffer alignment in bytes (a power of two).
 	// Nonzero: recipe-mounted filesystems get their buffers in
-	// MEMF_FAST | MEMF_PUBLIC (de_BufMemType) with de_Mask enforcing
-	// this alignment.
-	// 0: classic behavior (de_BufMemType MEMF_ANY, de_Mask word-aligned).
+	// MEMF_FAST | MEMF_PUBLIC (de_BufMemType). The alignment is not imposed
+	// on them - de_Mask stays word-aligned - so the device must bounce
+	// misaligned buffers itself.
+	// 0: classic behavior (de_BufMemType MEMF_ANY).
 	ULONG dmaAlign;
 	// Filesystem recipes, indexed by MOUNTFS_*. A NULL entry means that family
 	// is not mounted, except MOUNTFS_FAT, which falls back to the classic

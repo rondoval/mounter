@@ -570,16 +570,16 @@ void mnt_envec_from_recipe(struct MountData *md, struct DosEnvec *de,
 	de->de_HighCyl        = highCyl;
 	de->de_NumBuffers     = fs->buffers ? fs->buffers : 5;
 	de->de_MaxTransfer    = fs->maxTransfer ? fs->maxTransfer : 0x100000;
-	/* When the host controller reports a DMA alignment, put the filesystem's
-	 * buffer cache in Fast memory and require that alignment
-	 * via de_Mask. Otherwise keep classic behavior. */
-	if (md->dmaAlign > 1) {
-		de->de_BufMemType = MEMF_FAST|MEMF_PUBLIC|MEMF_CLEAR;
-		de->de_Mask       = 0x7FFFFFFE & ~((ULONG)md->dmaAlign - 1);
-	} else {
-		de->de_BufMemType = MEMF_ANY|MEMF_CLEAR;
-		de->de_Mask       = 0x7FFFFFFE;
-	}
+	/* A device that reports a DMA alignment gets the filesystem's own buffers
+	 * in Fast memory, out of Chip RAM. The alignment itself is not imposed
+	 * through de_Mask: filesystems cannot honour it (PFS3 has no aligned
+	 * allocator and raises a requester per buffer, FFS drops to 512-byte
+	 * reads, fat95 to its cluster cache), and the device bounces misaligned
+	 * or unreachable buffers itself. No MEMF_CLEAR: it is an allocation flag,
+	 * not a memory property, so fat95's "caller buffer has every BufMemType
+	 * bit" test would never pass. */
+	de->de_BufMemType = (md->dmaAlign > 1) ? (MEMF_FAST|MEMF_PUBLIC) : MEMF_ANY;
+	de->de_Mask       = 0x7FFFFFFE;
 	de->de_DosType        = fs->dosType;
 	de->de_BootPri        = bootPri;
 	if (fs->control) {

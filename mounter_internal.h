@@ -110,7 +110,7 @@ struct MountData
 
 	ULONG flags;                    /* MSF_* */
 	const struct MountFS *fs[MOUNTFS_KINDS];   /* indexed by MOUNTFS_* */
-	ULONG dmaAlign;                 /* requested buffer alignment in bytes, 0 = default */
+	ULONG dmaAlign;                 /* device DMA alignment, nonzero = FS buffers in Fast RAM */
 	BOOL legacyMounted;             /* per unit, for MSF_LEGACY_FIRST_ONLY */
 	LONG deferred;                  /* volumes skipped for want of a loadable handler */
 	LONG alreadyMounted;            /* volumes left alone because this extent is mounted */
