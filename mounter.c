@@ -287,8 +287,12 @@ static BOOL is_same_extent(struct MountData *md, BPTR startup, ULONG lowCyl, ULO
 	if (de->de_LowCyl != lowCyl || de->de_HighCyl != highCyl) {
 		return FALSE;
 	}
-	return bstr_equal_ci(dev, md->devicename,
-	                     (UWORD)strlen((const char *)md->devicename));
+	// MakeDosNode() counts the terminating NUL in this BSTR's length
+	// ("usbscsi.device" is 15 there), a node from Mount or a DOSDriver need
+	// not: accept both, the + 1 comparing our own NUL against the counted one.
+	const UWORD len = (UWORD)strlen((const char *)md->devicename);
+	return bstr_equal_ci(dev, md->devicename, len) ||
+	       bstr_equal_ci(dev, md->devicename, (UWORD)(len + 1));
 }
 
 // TRUE if a DeviceNode for exactly this device, unit and extent already exists.

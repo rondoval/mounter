@@ -14,6 +14,17 @@ not a diff you can apply.
 **The fork requires AmigaOS 3.1 (V40) and up** — upstream's Kickstart 1.3/2.x
 fallbacks are gone (see Removed).
 
+## 2026-11 — the duplicate-extent guard matches again
+
+- **`is_same_extent()` never matched a node of ours.** `MakeDosNode()` counts the
+  terminating NUL in the startup packet's device BSTR (`usbscsi.device` has length
+  15 there), and the comparison demanded `strlen()`. So a remount of a volume that
+  was already mounted always fell through to the naming step: a replugged stick
+  whose node had stayed (auto-unmount off) came back as `UMSD1:` beside `UMSD0:`,
+  a second handler on the same partition. Both lengths are accepted now: with the
+  NUL counted it is compared against the name's own terminator; a BSTR without one
+  (Mount, DOSDrivers) compares as before.
+
 ## 2026-09 — pre-DOS nodes get a real boot point
 
 - **Bootable, not merely listed.** `NT_BOOTNODE` got a pre-DOS node into the boot
