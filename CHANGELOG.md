@@ -14,6 +14,60 @@ not a diff you can apply.
 **The fork requires AmigaOS 3.1 (V40) and up** — upstream's Kickstart 1.3/2.x
 fallbacks are gone (see Removed).
 
+## 2026-11 — fixes from a review of the whole mounter
+
+- **Hunk loader** (`fs_relocate()`):
+  - The segment list linked each hunk to the one *before* it, so `fse_SegList`
+    reached the first hunk only; it now runs forward, as `LoadSeg()` builds it.
+  - Each segment's size long is in bytes, as `UnLoadSeg()` expects; it held
+    longs.
+  - `HUNK_RELOC32SHORT` read its count and hunk number as longs and lost the
+    word after each long read; it is words throughout now, and the pad word at
+    its end is dropped. `HUNK_DREL32` (1015), what V37 `LoadSeg()` takes for it
+    in a load file, is accepted too.
+  - An LSEG block carries `lsb_SummedLongs - 5` longs of data, not a fixed 123,
+    so 1024- and 2048-byte media with whole-block LSEGs load. A block with no
+    data ends the load: a cyclic `lsb_Next` could otherwise spin forever.
+- **RDSK checksum**: the RDB itself is now checksummed like its PART, FSHD and
+  LSEG blocks, and a summed-longs count below 3 (which checked nothing) fails.
+- **Mounting** (`mnt_mount_volume()`):
+  - A recipe's handler and control BSTRs are allocated after the duplicate
+    check and freed if `MakeDosNode()` fails; they leaked on every
+    already-mounted pass.
+  - `AddBootNode()`'s result is checked: a refused node is a failed mount, not
+    a counted one.
+  - The fake `ConfigDev` is made on the first bootable volume of a pre-DOS call,
+    not up front: a call that mounts nothing bootable allocates none.
+  - A name that cannot be bumped any further fails the mount instead of being
+    used unchecked; `renamed` counts a renamed volume once, not each bump.
+  - The duplicate check compares the whole geometry (block size, surfaces,
+    blocks per track) with the cylinders, and believes a startup field only when
+    it lies in RAM: SER:, PAR: and PRT: keep an integer there.
+  - A BootNode without a DeviceNode no longer crashes the name check.
+- **CD**: a recognized disc whose filesystem has to wait for DOS, or is
+  missing, reports "recognized, nothing mounted" (0), not "unrecognized" (-1).
+- **GPT**: the entry array is read at its 64-bit block number; it was cut to 32
+  bits. `mnt_read_block()` takes a 64-bit block.
+- **Blocks under 512 bytes** hold no MBR, GPT or VBR; the checks no longer read
+  past them.
+- Every function carries a kernel-doc comment: what it does, each parameter,
+  the return value.
+
+## 2026-11 — virtual drives
+
+- **MBR `0x76` and Emu68's GPT type are left to a virtual device.** Such a
+  partition holds a whole RDB disk, as on Emu68's SD card. The mount pass skips
+  it before the boot-sector sniff, so a fresh container with a stale FAT boot
+  sector is not mounted on its parent, and `mnt_scan_rdb()` ignores an `RDSK`
+  inside one.
+- **`vdrive.c` / `vdrive.h` (new)**: the exec device a host creates for them,
+  one unit per virtual drive, forwarding to the parent unit, with the write
+  fence the host applies on the parent. See README 4.5.
+- **One table walker.** `parse_mbr()`, `parse_ebr()` and `parse_gpt()` hand each
+  entry (`struct TableEntry`) to a callback: the mount pass is one callback,
+  `mnt_find_containers()` another. A GPT entry with `last < first` is skipped.
+- `sector_pool_free()` is exported as `mnt_sector_pool_free()`.
+
 ## 2026-11 — the duplicate-extent guard matches again
 
 - **`is_same_extent()` never matched a node of ours.** `MakeDosNode()` counts the

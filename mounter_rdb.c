@@ -6,7 +6,9 @@
 // copyright and licence covering this file.
 #include "mounter_internal.h"
 
-#define LSEG_DATASIZE (512 / 4 - 5)
+// Longs ahead of lsb_LoadData in a LoadSegBlock: ID, SummedLongs, ChkSum,
+// HostID, Next.
+#define LSEG_HEADER_LONGS 5
 
 // Hardening caps against corrupt/hostile on-disk metadata.
 // The RDB PART and FSHD chains are singly linked by block number; a cyclic link
@@ -33,7 +35,23 @@ struct LSegStream
 	UWORD hasword;
 };
 
-// Read multiple longs from LSEG blocks
+/**
+ * lseg_read_longs() - Read @longs longs from the LSEG chain into @data.
+ * @ls:    the stream; its cursor advances, and the next LSEG block is read into
+ *         ls->buf (mnt_read_block() with IDNAME_LOADSEG) when the current one
+ *         is used up
+ * @longs: how many longs to read; 0 reads nothing
+ * @data:  receives @longs longs; must hold that many
+ *
+ * Long-aligned only: a word buffered by lseg_read_word() is discarded
+ * (ls->hasword is cleared first). Each LSEG block yields lsb_SummedLongs - 5
+ * longs: the checksummed size, which mnt_read_block() has bounded by the block
+ * size. struct LoadSegBlock's lsb_LoadData[123] is the 512-byte case only.
+ *
+ * Return: TRUE when all @longs were read; FALSE when the chain ends early
+ * (lsb_Next 0xffffffff) or a block fails to read, is not a valid LSEG block (ID,
+ * checksum) or carries no data, with @data partly written
+ */
 static BOOL lseg_read_longs(struct LSegStream *ls, ULONG longs, ULONG *data)
 {
 	ULONG cnt = 0;
@@ -56,31 +74,58 @@ static BOOL lseg_read_longs(struct LSegStream *ls, ULONG longs, ULONG *data)
 			if (!mnt_read_block((UBYTE*)ls->buf, ls->block, IDNAME_LOADSEG, ls->md)) {
 				return FALSE;
 			}
-			ls->longs = LSEG_DATASIZE;
+			// A block without data would let a cyclic lsb_Next spin forever.
+			if (ls->buf->lsb_SummedLongs <= LSEG_HEADER_LONGS) {
+				return FALSE;
+			}
+			ls->longs = ls->buf->lsb_SummedLongs - LSEG_HEADER_LONGS;
 			ls->offset = 0;
 			ls->block = ls->buf->lsb_Next;
 		}
 	}
 	return TRUE;
 }
-// Read single long from LSEG blocks
+
+/**
+ * lseg_read_long() - Read one long from the LSEG chain.
+ * @ls:   the stream
+ * @data: receives the long; written only on success
+ *
+ * While a word from lseg_read_word() is buffered the long straddles two stream
+ * longs: it is the buffered word and the high word of the next long, whose low
+ * word is buffered in turn (ls->hasword stays TRUE).
+ *
+ * Return: TRUE on success; FALSE as for lseg_read_longs()
+ */
 static BOOL lseg_read_long(struct LSegStream *ls, ULONG *data)
 {
 	BOOL v;
 	if (ls->hasword) {
+		ULONG high = ls->wordbuf;
 		ULONG temp;
-		v = lseg_read_longs(ls, 1, &temp);
+		v = lseg_read_longs(ls, 1, &temp);      // clears ls->hasword
 		if (v) {
-			*data = (ls->wordbuf << 16) | (temp >> 16);
+			*data = (high << 16) | (temp >> 16);
 			ls->wordbuf = (UWORD)temp;
+			ls->hasword = TRUE;
 		}
 	} else {
 		v = lseg_read_longs(ls, 1, data);
 	}
 	return v;
 }
-// Read single word from LSEG blocks
-// Internally reads long and buffers second word.
+
+/**
+ * lseg_read_word() - Read one word from the LSEG chain.
+ * @ls:   the stream
+ * @data: receives the word, zero-extended; left as it was on failure
+ *
+ * Internally reads a long, returns its high word and buffers the second word in
+ * ls->wordbuf (ls->hasword) for the next call.
+ *
+ * Return: TRUE on success, including a word served from the buffer; FALSE as
+ * for lseg_read_longs()
+ */
 static BOOL lseg_read_word(struct LSegStream *ls, ULONG *data)
 {
 	if (ls->hasword) {
@@ -106,7 +151,33 @@ struct RelocHunk
 	ULONG *hunkData;
 };
 
-// Filesystem relocator
+/**
+ * fs_relocate() - Load and relocate a hunk-format filesystem off the LSEG chain.
+ * @ls: the stream, set up at the first LSEG block (ls->block) with a scratch
+ *      sector in ls->buf; read up to the end of the load file
+ *
+ * Takes a HUNK_HEADER load file without resident library names or overlays.
+ * Every hunk in the header's table is allocated up front (MEMF_PUBLIC, plus
+ * MEMF_CHIP for HUNKF_CHIP, or the flags long that follows when both HUNKF_CHIP
+ * and HUNKF_FAST are set; always MEMF_CLEAR) with two longs in front, as
+ * LoadSeg() leaves a segment: the allocation's size in bytes, and the link, a
+ * BPTR to the next hunk's link long (0 after the last). HUNK_CODE, HUNK_DATA and
+ * HUNK_BSS are then loaded in order, and relocations applied to the hunk loaded
+ * last: HUNK_RELOC32 in longs, HUNK_RELOC32SHORT in words padded to a long, and
+ * HUNK_DREL32 like HUNK_RELOC32SHORT, as V37 LoadSeg() takes it in a load file
+ * (dos/doshunks.h). That goes on until the HUNK_END of the last hunk or a
+ * failed read after it; any other hunk type fails the load. The chain is untrusted disk
+ * data: the hunk count is capped at MAX_RELOC_HUNKS, each hunk at
+ * MAX_HUNK_LONGS, and every loaded size and relocation offset is checked
+ * against the allocation. Ends with CacheClearU(), since the relocated
+ * filesystem is about to be executed.
+ *
+ * Return: the address of the first hunk's link long, the head of the segment
+ * list, for MKBADDR() into fse_SegList; NULL, with every hunk freed, when the data
+ * is not such a load
+ * file, a read fails before the last hunk is loaded, an allocation fails, or a
+ * hunk or relocation is out of bounds
+ */
 static APTR fs_relocate(struct LSegStream *ls)
 {
 	struct ExecBase *SysBase = ls->md->SysBase;
@@ -164,8 +235,8 @@ static APTR fs_relocate(struct LSegStream *ls)
 		return NULL;
 	}
 
-	// Pre-allocate hunks
-	ULONG *prevChunk = NULL;
+	// Pre-allocate hunks, each linked from the one before it
+	ULONG *prevLink = NULL;
 	hunkCnt = 0;
 	while (hunkCnt < totalHunks) {
 		struct RelocHunk *rh = &relocHunks[hunkCnt];
@@ -194,9 +265,11 @@ static APTR fs_relocate(struct LSegStream *ls)
 			goto end;
 		}
 		dbg("hunk %ld: ptr 0x%08lx, size %ld, memory flags %08lx\n", hunkCnt + firstHunk, (ULONG)rh->hunkData, hunkHeadSize, memoryFlags);
-		rh->hunkData[0] = rh->hunkSize + 2;
-		rh->hunkData[1] = (ULONG)MKBADDR(prevChunk);
-		prevChunk = &rh->hunkData[1];
+		rh->hunkData[0] = (rh->hunkSize + 2) * sizeof(ULONG);
+		rh->hunkData[1] = 0;
+		if (prevLink)
+			*prevLink = (ULONG)MKBADDR(&rh->hunkData[1]);
+		prevLink = &rh->hunkData[1];
 		rh->hunkData += 2;
 
 		if (!firstProcessedHunk) {
@@ -244,19 +317,22 @@ static APTR fs_relocate(struct LSegStream *ls)
 			break;
 			case HUNK_RELOC32:
 			case HUNK_RELOC32SHORT:
+			case HUNK_DREL32:
 			{
+				// The short form is all words: count, hunk number, offsets.
+				const BOOL words = hunkType != HUNK_RELOC32;
 				ULONG relocCnt, relocHunk;
 				if (rh == NULL) {
 					goto end;
 				}
 				for (;;) {
-					if (!lseg_read_long(ls, &relocCnt)) {
+					if (!(words ? lseg_read_word(ls, &relocCnt) : lseg_read_long(ls, &relocCnt))) {
 						goto end;
 					}
 					if (!relocCnt) {
 						break;
 					}
-					if (!lseg_read_long(ls, &relocHunk)) {
+					if (!(words ? lseg_read_word(ls, &relocHunk) : lseg_read_long(ls, &relocHunk))) {
 						goto end;
 					}
 					relocHunk -= firstHunk;
@@ -267,14 +343,8 @@ static APTR fs_relocate(struct LSegStream *ls)
 					struct RelocHunk *rhr = &relocHunks[relocHunk];
 					while (relocCnt != 0) {
 						ULONG relocOffset;
-						if (hunkType == HUNK_RELOC32SHORT) {
-							if (!lseg_read_word(ls, &relocOffset)) {
-								goto end;
-							}
-						} else {
-							if (!lseg_read_long(ls, &relocOffset)) {
-								goto end;
-							}
+						if (!(words ? lseg_read_word(ls, &relocOffset) : lseg_read_long(ls, &relocOffset))) {
+							goto end;
 						}
 						// Guard hunkSize == 0: (0 - 1) * 4 would wrap to a huge
 						// bound and let any offset through into a zero-size hunk.
@@ -297,6 +367,8 @@ static APTR fs_relocate(struct LSegStream *ls)
 						relocCnt--;
 					}
 				}
+				// An odd number of words ends in a pad word, still buffered.
+				ls->hasword = FALSE;
 			}
 			break;
 			case HUNK_END:
@@ -335,16 +407,24 @@ end:
 	return firstProcessedHunk;
 }
 
-// Build a FileSysEntry from an RDB FileSysHeaderBlock, unless FileSystem.resource
-// already carries an entry for this dostype at the same version or newer.
-//
-// Returns a fresh, unregistered entry with no seglist yet — the caller loads and
-// relocates the filesystem into it and then hands it to fse_register(). Returns NULL if
-// the resource's existing entry is good enough, if the allocation fails, or if
-// FileSystem.resource cannot be reached at all.
-//
-// Both the dostype and the version come out of the header block, so there is
-// nothing for the caller to pass alongside it and nothing that can disagree.
+/**
+ * fse_from_fshb() - Build a FileSysEntry from an RDB FileSysHeaderBlock.
+ * @fshb: the FSHD block as read off the disk; only read
+ * @md:   mount state; md->creator (or "" when NULL) is copied behind the entry
+ *        as its ln_Name
+ *
+ * Nothing is built when FileSystem.resource already carries an entry for
+ * fhb_DosType at fhb_Version or newer. Both the dostype and the version come out of the header
+ * block, so there is nothing for the caller to pass alongside it and nothing
+ * that can disagree. The fields fhb_PatchFlags selects are copied as they are;
+ * with bit 0x0080 that puts the fhb_SegListBlocks block number in fse_SegList,
+ * which the caller overwrites. Runs under Forbid().
+ *
+ * Return: a fresh, unregistered entry with no seglist yet — the caller loads and
+ * relocates the filesystem into it and then hands it to fse_register(); NULL if
+ * the resource's existing entry is good enough, if the allocation fails, or if
+ * FileSystem.resource cannot be reached at all
+ */
 static struct FileSysEntry *fse_from_fshb(struct FileSysHeaderBlock *fshb, struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -394,10 +474,20 @@ static struct FileSysEntry *fse_from_fshb(struct FileSysHeaderBlock *fshb, struc
 	return fse;
 }
 
-// Add new FileSysEntry to FileSystem.resource, or free it if the filesystem
-// load failed (fse_SegList == 0) or the resource can't be reached. Returns TRUE
-// if the entry survived (added and still valid to read), FALSE if it was freed —
-// the caller must drop its pointer in that case, or it dangles.
+/**
+ * fse_register() - Add a new FileSysEntry to FileSystem.resource, or free it.
+ * @fse: an entry from fse_from_fshb() with fse_SegList set, 0 if the filesystem
+ *       load failed; the resource owns it once added, else it is freed here
+ * @md:  mount state; md->creator must be what fse_from_fshb() saw, as the
+ *       free size comes from its length
+ *
+ * The entry is freed if the filesystem load failed (fse_SegList == 0) or the
+ * resource can't be reached. It goes in with AddHead() under Forbid(), so
+ * mnt_find_filesystem() finds it ahead of any older entry for the dostype.
+ *
+ * Return: TRUE if the entry survived (added and still valid to read); FALSE if
+ * it was freed — the caller must drop its pointer in that case, or it dangles
+ */
 static BOOL fse_register(struct FileSysEntry *fse, struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -419,7 +509,23 @@ static BOOL fse_register(struct FileSysEntry *fse, struct MountData *md)
 	return FALSE;
 }
 
-// Parse FileSystem Header Blocks, load and relocate filesystem if needed.
+/**
+ * parse_fshd() - Parse the FSHD chain; load and relocate the filesystem if needed.
+ * @block:   first FSHD block (rdb_FileSysHeaderList); 0xffffffff = none
+ * @dostype: the partition's de_DosType
+ * @md:      mount state; two scratch sectors are taken from its pool and dropped
+ *           again
+ *
+ * Walks the fhb_Next chain, at most MAX_RDB_FILESYS blocks, to the first FSHD
+ * for @dostype; an unreadable or invalid block ends the walk. Unless
+ * fse_from_fshb() finds FileSystem.resource's entry good enough, the FSHD's
+ * LSEG chain goes through fs_relocate() and the entry to fse_register(). If
+ * either scratch sector cannot be had, only the FileSystem.resource lookup runs.
+ *
+ * Return: the FileSysEntry to mount with: the one just loaded and registered,
+ * else FileSystem.resource's entry for @dostype (also when no FSHD on this disk
+ * carries the dostype or loading it failed); NULL if there is neither
+ */
 static struct FileSysEntry *parse_fshd(ULONG block, ULONG dostype, struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -472,8 +578,22 @@ static struct FileSysEntry *parse_fshd(ULONG block, ULONG dostype, struct MountD
 	return fse;
 }
 
-// Parse one PART block and mount what it describes. Returns the next PART block in
-// the chain; what was mounted lands in md->mounted.
+/**
+ * parse_part() - Parse one PART block and mount what it describes.
+ * @buf:          the caller's scratch sector; overwritten with the PART block,
+ *                whose pb_DriveName is clamped in place
+ * @block:        the PART block number
+ * @filesysblock: first FSHD block (rdb_FileSysHeaderList), for parse_fshd()
+ * @md:           mount state; MSF_NO_BOOT in md->flags makes the volume
+ *                non-bootable
+ *
+ * A PBFF_NOMOUNT partition is skipped. What was mounted lands in md->mounted,
+ * counted by mnt_mount_volume().
+ *
+ * Return: the next PART block in the chain (pb_Next), also when this partition
+ * is skipped, the Volume cannot be allocated or the mount fails; 0xffffffff
+ * when @block cannot be read as a valid PART block
+ */
 static ULONG parse_part(UBYTE *buf, ULONG block, ULONG filesysblock, struct MountData *md)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -534,7 +654,15 @@ static ULONG parse_part(UBYTE *buf, ULONG block, ULONG filesysblock, struct Moun
 	return nextpartblock;
 }
 
-// Walk the PART chain, mounting as we go. What was mounted lands in md->mounted.
+/**
+ * parse_rdsk() - Walk the PART chain, mounting as we go.
+ * @buf: the scratch sector holding the RDSK block; reused for every PART block,
+ *       so the RDSK is gone on return
+ * @md:  mount state; md->wasLastDev is set from RDBFF_LAST in rdb_Flags
+ *
+ * What was mounted lands in md->mounted. The walk is capped at
+ * MAX_RDB_PARTITIONS blocks.
+ */
 static void parse_rdsk(UBYTE *buf, struct MountData *md)
 {
 	struct RigidDiskBlock *rdb = (struct RigidDiskBlock*)buf;
@@ -554,8 +682,20 @@ static void parse_rdsk(UBYTE *buf, struct MountData *md)
 	md->wasLastDev = (flags & RDBFF_LAST) != 0;
 }
 
-// Search for an RDB and, if there is one, mount its partitions.
-// Returns TRUE if this medium was recognized as RDB; the count is in md->mounted.
+/**
+ * mnt_scan_rdb() - Search for an RDB and, if there is one, mount its partitions.
+ * @md: mount state of the open unit; one scratch sector is taken from its pool
+ *      and dropped again
+ *
+ * Reads blocks 0 to RDB_LOCATION_LIMIT - 1, passing over unreadable ones, and
+ * takes the first valid RDSK block: rdb_ID IDNAME_RIGIDDISK and a good checksum,
+ * as for every other RDB block. An RDSK past block 0 that mnt_in_container()
+ * places in a virtual drive is skipped.
+ *
+ * Return: TRUE if this medium was recognized as RDB, even if nothing on it
+ * mounted; the count is in md->mounted. FALSE if no RDSK was found or no
+ * scratch sector was available
+ */
 BOOL mnt_scan_rdb(struct MountData *md)
 {
 	UBYTE *buf = mnt_sector_take(md);
@@ -563,14 +703,17 @@ BOOL mnt_scan_rdb(struct MountData *md)
 		return FALSE;
 	BOOL found = FALSE;
 	for (UWORD i = 0; i < RDB_LOCATION_LIMIT; i++) {
-		if (mnt_read_block(buf, i, 0xffffffff, md)) {
-			struct RigidDiskBlock *rdb = (struct RigidDiskBlock*)buf;
-			if (rdb->rdb_ID == IDNAME_RIGIDDISK) {
-				dbg("RDB found, block %lu\n", i);
-				parse_rdsk(buf, md);
-				found = TRUE;
-				break;
+		if (mnt_read_block(buf, i, IDNAME_RIGIDDISK, md)) {
+			// An RDSK past block 0 may be the first block of a virtual drive
+			// that starts that low: that RDB is the virtual device's, not ours.
+			if (i && mnt_in_container(md, i)) {
+				dbg("RDB at block %lu is a virtual drive's\n", (ULONG)i);
+				continue;
 			}
+			dbg("RDB found, block %lu\n", (ULONG)i);
+			parse_rdsk(buf, md);
+			found = TRUE;
+			break;
 		}
 	}
 	mnt_sector_drop(md, buf);

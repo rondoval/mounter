@@ -26,7 +26,19 @@ struct __packed __attribute__((aligned(2))) SCSI_CD_TOC {
     struct SCSI_TOC_TRACK_DESCRIPTOR td[SCSI_CD_MAX_TRACKS];
 };
 
-// Check if there is a disc inserted
+/**
+ * is_unit_ready() - Check if there is a disc inserted.
+ * @md:  mount state; only md->SysBase is used
+ * @req: the unit's open request (md->request), DoIO()'d; io_Command, io_Error
+ *       and io_Actual are overwritten
+ *
+ * Sends CMD_START first to spin the disc up, ignoring its error, then
+ * TD_CHANGESTATE.
+ *
+ * Return: TRUE if TD_CHANGESTATE reports a disc (io_Actual == 0) or the device
+ * does not support it (IOERR_NOCMD, taken as ready); FALSE if it reports no
+ * disc or fails otherwise
+ */
 static BOOL is_unit_ready(struct MountData *md, struct IOStdReq *req)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -58,7 +70,20 @@ static BOOL is_unit_ready(struct MountData *md, struct IOStdReq *req)
 #define CDDISC_DATA    1	// track 1 is a data track
 #define CDDISC_AUDIO   2	// track 1 is an audio track
 
-// Classify the disc by reading the TOC and checking track 1's data-track bit.
+/**
+ * classify_cd() - Classify the disc by reading the TOC and checking track 1's data-track bit.
+ * @md:  mount state; only md->SysBase is used
+ * @ior: the unit's open request, DoIO()'d with HD_SCSICMD; io_Command, io_Data
+ *       and io_Length are overwritten
+ *
+ * Sends READ TOC (format 0, LBA, from track 1) up to three times, until both
+ * io_Error and scsi_Status are 0. The data-track bit is 0x04 of the track
+ * descriptor's control nibble.
+ *
+ * Return: CDDISC_DATA or CDDISC_AUDIO by that bit; CDDISC_UNKNOWN if the TOC
+ * cannot be read (allocation failure, I/O error or CHECK CONDITION on every
+ * try) or does not start at track 1
+ */
 static int classify_cd(struct MountData *md, struct IOStdReq *ior)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -120,16 +145,26 @@ static int classify_cd(struct MountData *md, struct IOStdReq *ior)
 // contents; the rest tell mnt_scan_cd how much it may assume. PVD_NONE is not a
 // rejection - plenty of formats the CD handler reads (High Sierra, plain UDF,
 // HFS/HFS+) have nothing at all at sector 16 offset 1.
-#define PVD_ERROR      -2	// sector 16 unreadable
+#define PVD_ERROR      -2	// sector 16 unreadable, or no buffer to read it into
 #define PVD_NONE       -1	// readable, but no ISO9660 PVD
 #define PVD_DATA        0	// ISO9660, not Amiga-bootable
 #define PVD_AMIGABOOT   1	// ISO9660 with "CDTV" or "AMIGA BOOT" as the System ID
 
-// read_pvd
-// Read the ISO9660 Primary Volume Descriptor to decide boot priority: is the
-// System ID "CDTV" or "AMIGA BOOT"? Identifying the disc's format is the CD
-// filesystem's job, not ours.
-// Returns: one of the PVD_* values above.
+/**
+ * read_pvd() - Read the ISO9660 Primary Volume Descriptor to decide boot priority.
+ * @md:  mount state; only md->SysBase is used
+ * @ior: the unit's open request, DoIO()'d with CMD_READ of 2048 bytes at byte
+ *       offset 32768 (sector 16), up to three tries; io_Command, io_Data,
+ *       io_Length and io_Offset are overwritten
+ *
+ * Is the System ID "CDTV" or "AMIGA BOOT"? Identifying the disc's format is the
+ * CD filesystem's job, not ours.
+ *
+ * Return: PVD_AMIGABOOT if sector 16 is an ISO9660 PVD (type 1, "CD001",
+ * version 1) whose System ID starts with "CDTV" or "AMIGA BOOT"; PVD_DATA for
+ * any other ISO9660 PVD; PVD_NONE if the sector reads but holds no PVD;
+ * PVD_ERROR if it cannot be read, or the buffer cannot be allocated
+ */
 static LONG read_pvd(struct MountData *md, struct IOStdReq *ior)
 {
 	struct ExecBase *SysBase = md->SysBase;
@@ -169,14 +204,26 @@ done:
 	return ret;
 }
 
-// Mount a CDROM (Amiga-bootable data discs get boot priority). What format the
-// disc carries is the CD recipe's filesystem's business; the recipe declares
-// what it can cope with. MOUNTFS_CD_ANYFMT means it identifies formats itself (e.g.
-// ODFileSystem: High Sierra, UDF, HFS/HFS+ besides ISO9660), MOUNTFS_CD_AUDIO that
-// it can present audio-only discs (ODFileSystem exposes the tracks as WAV
-// files). Without those a data disc has to be ISO9660 and an audio disc is
-// refused, which is all a legacy CDFileSystem can do.
-// Returns TRUE if a mountable disc was recognized; the count is in md->mounted.
+/**
+ * mnt_scan_cd() - Mount a CDROM as one whole-medium volume.
+ * @md: mount state of the open unit; md->fs[MOUNTFS_CD] is the recipe, NULL
+ *      for the classic CD01/CDVD entry in FileSystem.resource
+ *
+ * Amiga-bootable data discs get boot priority: 5, else MOUNT_NEVER_BOOT (an
+ * RDB CD's partitions follow their RDB). What format the disc carries is the CD
+ * recipe's filesystem's business; the recipe declares what it can cope with.
+ * MOUNTFS_CD_ANYFMT means it identifies formats itself (e.g. ODFileSystem: High
+ * Sierra, UDF, HFS/HFS+ besides ISO9660), MOUNTFS_CD_AUDIO that it can present
+ * audio-only discs (ODFileSystem exposes the tracks as WAV files). Without
+ * those a data disc has to be ISO9660 and an audio disc is refused, which is
+ * all a legacy CDFileSystem can do. A data disc without an ISO9660 PVD is tried
+ * as an RDB CD (mnt_scan_rdb()) first, unless MSF_NO_RDB.
+ *
+ * Return: TRUE if the disc was recognized: an RDB on it, or a data or audio
+ * disc the recipe takes, whether or not its volume then mounts (md->mounted
+ * counts it; md->deferred one whose filesystem waits for DOS). FALSE if there is
+ * no disc or the disc is refused
+ */
 BOOL mnt_scan_cd(struct MountData *md)
 {
 	const struct MountFS *fs = md->fs[MOUNTFS_CD];
@@ -230,18 +277,20 @@ BOOL mnt_scan_cd(struct MountData *md)
 		return FALSE;
 	}
 
+	// From here on the disc is recognized, whatever becomes of its volume: a
+	// filesystem that has to wait for DOS, or none at all, mounts nothing.
 	if (!fs) {
 		// No recipe: classic behavior, CD01/CDVD from FileSystem.resource only.
 		struct FileSysEntry *fse = mnt_find_filesystem(0x43443031, 0x43445644, md->SysBase);
 		if (!fse) {
 			printf("Could not load filesystem\n");
-			return FALSE;
+			return TRUE;
 		}
 		memset(&classicCD, 0, sizeof(classicCD));
 		classicCD.dosType = fse->fse_DosType; // CD01 / CDVD
 		fs = &classicCD;
 	} else if (!mnt_resolve_fs(md, fs, 0)) {
-		return FALSE;
+		return TRUE;
 	}
 
 	// Whole-medium mount: the CD filesystem reads the disc directly, so LowCyl/
@@ -252,5 +301,6 @@ BOOL mnt_scan_cd(struct MountData *md)
 		.bootPri  = bootPri,
 	};
 	mnt_envec_from_recipe(md, &vol.pp.de, fs, 0, 0, bootPri);
-	return mnt_mount_volume(md, &vol) != MOUNT_FAILED;
+	mnt_mount_volume(md, &vol);
+	return TRUE;
 }

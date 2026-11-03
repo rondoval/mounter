@@ -65,7 +65,8 @@ struct MountFS
 // What one MountDrive() call did. Optional: pass NULL if none of it is wanted.
 struct MountResult
 {
-	// Volumes mounted across all units.
+	// Volumes live on the units after the call, across all units: mounted now,
+	// or found already mounted (those are in alreadyMounted as well).
 	LONG mounted;
 	// Volumes skipped because their filesystem could not be resolved *yet* — a
 	// handler that has to be loaded from L: while there was no dos.library.
@@ -78,7 +79,8 @@ struct MountResult
 	// was partly mounted before DOS existed. It is also the only evidence that
 	// the duplicate-node guard is doing its job, so it is worth logging.
 	LONG alreadyMounted;
-	// DOS names that had to be bumped past a collision ("ZZ0" -> "ZZ1").
+	// Volumes whose DOS name had to be bumped past a collision ("ZZ0" -> "ZZ1"),
+	// one each however far the name moved.
 	// Legitimate when two drives want the same name; the signature of a bug when
 	// it is one volume being mounted twice. Worth reporting either way — on a
 	// release build the mounter's own logging is compiled out, so this counter is
@@ -107,7 +109,8 @@ struct MountStruct
 	// entries this mount adds. If NULL: use device name.
 	const UBYTE *creatorName;
 	// ConfigDev: set if autoconfig board autoboot support is wanted.
-	// If NULL and bootable partition found: fake ConfigDev is automatically created.
+	// If NULL, a fake ConfigDev is created on the first bootable partition found
+	// before DOS exists, and shared by the rest of the call.
 	struct ConfigDev *configDev;
 	// SysBase.
 	struct ExecBase *SysBase;
@@ -127,10 +130,8 @@ struct MountStruct
 	const struct MountFS *fs[MOUNTFS_KINDS];
 };
 
-// Returns the total number of volumes mounted across all units (>0);
-// 0 if at least one unit carried a recognized medium but nothing was mounted;
-// -1 if no partition table / filesystem was recognized on any unit.
-// 'res' may be NULL; see struct MountResult for the per-call breakdown.
+// Mount the volumes on ms->units of ms->deviceName. The contract, return value
+// included, is MountDrive()'s kernel-doc in mounter.c.
 LONG MountDrive(const struct MountStruct *ms, struct MountResult *res);
 
 #endif

@@ -27,7 +27,9 @@ filesystems, and make the partitions available to the operating system.
 It is built from four sources: `mounter.c` (entry, per-unit dispatch, and the
 single path that creates a `DeviceNode`), `mounter_rdb.c` (RDB, FSHD, hunk
 loader), `mounter_legacy.c` (MBR, EBR chains, GPT, superfloppy) and
-`mounter_cd.c` (CD/DVD/BD). `mounter_internal.h` carries what they share.
+`mounter_cd.c` (CD/DVD/BD). `mounter_internal.h` carries what they share. A
+fifth, `vdrive.c` with its own header `vdrive.h`, is the device a host builds
+for virtual drives (4.5); a host that has none can leave it out.
 
 ---
 
@@ -82,6 +84,11 @@ loader), `mounter_legacy.c` (MBR, EBR chains, GPT, superfloppy) and
 * **Collision-safe device naming**: preferred names get a trailing digit
   ensured ("UMSD" → "UMSD0") and bumped past collisions ("UMSD1" … "UMSD10"),
   checked against both the pre-boot MountList and the live DOS lists.
+* **Virtual drives**: an MBR partition of type `0x76` (primary or logical) or a
+  GPT partition of Emu68's type `3F82EEBC-87C9-4097-8165-89D6540557C0` holds a
+  whole RDB disk, as on Emu68's SD card. The mount pass leaves it alone; the
+  host's virtual device (`vdrive.c`, see 4.5) makes it a unit of its own, where
+  the RDB inside mounts and boots.
 * **Hardened against corrupt media**: untrusted on-disk fields are clamped,
   block chains are cycle-capped, and the hunk relocator is overflow-checked
   (see 4.4).
@@ -225,11 +232,15 @@ A critical function is `fs_relocate` (`mounter_rdb.c`), which loads Amiga HUNK-f
 filesystem binaries from disk into memory.
 1.  It starts by reading a `HUNK_HEADER`.
 2.  It pre-allocates memory for all hunks (`HUNK_CODE`, `HUNK_DATA`,
-    `HUNK_BSS`) defined in the header.
-3.  It reads each hunk's data from the LSEG (Load Segment) blocks on disk.
-4.  It processes relocation hunks (`HUNK_RELOC32`) to resolve memory address
-    pointers within the loaded code and data, making the filesystem executable
-    from its new location in RAM.
+    `HUNK_BSS`) defined in the header, each laid out as `LoadSeg()` leaves a
+    segment: its size in bytes, then the BPTR link to the next hunk.
+3.  It reads each hunk's data from the LSEG (Load Segment) blocks on disk;
+    each block holds `lsb_SummedLongs - 5` longs, whatever the block size.
+4.  It processes relocation hunks to resolve memory address pointers within the
+    loaded code and data, making the filesystem executable from its new
+    location in RAM: `HUNK_RELOC32` in longs, `HUNK_RELOC32SHORT` in words, and
+    `HUNK_DREL32`, which V37 `LoadSeg()` reads as `HUNK_RELOC32SHORT` in a load
+    file.
 5.  Finally, it performs a `CacheClearU()` to ensure instruction caches are
     flushed before the OS attempts to execute the newly loaded code.
 
@@ -274,8 +285,73 @@ with corrupt or hostile metadata):
   `fhb_Next` loop cannot hang the caller.
 * The hunk relocator bounds hunk counts, per-hunk sizes and relocation offsets
   against 32-bit overflow.
-* Block checksums bound their summed-longs count to the sector size; MBR/GPT
-  tables must pass sanity/CRC checks before being believed.
+* Every RDB block (RDSK, PART, FSHD, LSEG) must carry its ID and a good
+  checksum; the summed-longs count must cover the block's header and fit the
+  sector. MBR/GPT tables must pass sanity/CRC checks before being believed.
+* A DOS device's startup field is believed to be a FileSysStartupMsg only when
+  it, its device name and its DosEnvec lie in RAM: SER:, PAR: and PRT: keep an
+  integer there.
+
+### 4.5. Virtual Drives (`vdrive.c`)
+
+A virtual drive is a partition holding a whole RDB disk: the RDB sits in its
+first blocks, and every block number inside counts from the partition start.
+Mounting the inner partitions on the parent unit at shifted positions does not
+work: SmartFilesystem records its own position on disk and refuses a moved
+volume, and HDToolBox could not edit the inner RDB. So each virtual drive
+becomes a unit of a separate exec device, addressed from its first block, and
+the same volume then reads alike here and on Emu68.
+
+**The scan.** The mount pass (`mounter_legacy.c`) skips the `0x76` type and
+the Emu68 GUID before it looks at the boot sector, so a container is never
+mounted on its parent, and `mnt_scan_rdb()` ignores an `RDSK` that lies inside
+one. `mnt_find_containers()` lists them for `vdrive.c`.
+
+**One device per host.** The host names it (`nvmevd.device`,
+`usbscsivd.device`) and holds a `struct VDrive *`, NULL until
+`VDriveRefresh()` finds the first virtual drive anywhere and creates the
+device. A system without virtual drives never gets one, and every other call
+accepts NULL.
+
+**Units.** `VDRIVE_UNIT(parent, slot)` = `parent * 10 + slot`, slot being the
+virtual drive's order on its parent unit. HDToolBox reads a unit number as
+address + 10 × LUN, so it shows the slot as the address and the parent unit as
+the LUN. Ten slots per parent are exposed; the rest are fenced but get no unit.
+A unit is at most 2^32 blocks.
+
+**What the device does.** It forwards reads, writes and formats to the parent
+unit as 64-bit trackdisk requests (`NSCMD_TD_*64`) at the container's offset,
+from a pool of its own requests, replied to a `PA_SOFTINT` port: no task of
+its own, no allocation per I/O. Geometry, change counting, change interrupts
+and `NSCMD_DEVICEQUERY` are answered locally, and `HD_SCSICMD` is emulated
+for HDToolBox (INQUIRY, READ CAPACITY, MODE SENSE pages 3 and 4, the READ,
+WRITE and VERIFY variants, SYNCHRONIZE CACHE). The last close of a unit sends
+the parent a `CMD_UPDATE`.
+
+**The fence.** On the parent unit the virtual drives' blocks are read-only to
+everyone but the virtual device. The host asks on its write paths:
+* `VDriveWriteAllowed(vd, io, unit, offset, length)` for every write, format,
+  write-zeroes or trim, by byte range;
+* `VDriveScsiAllowed(vd, io, unit, cmd)` for `HD_SCSICMD`: reads and queries
+  pass, WRITE, WRITE AND VERIFY and WRITE SAME are range-checked, UNMAP per
+  descriptor, ATA PASS-THROUGH only for data-in, and anything else is refused
+  with DATA PROTECT (07/27h) in the sense data.
+
+A refused write completes with `TDERR_WriteProt`, a refused SCSI command with
+`HFERR_BadStatus`. Up to 16 virtual drives per parent are fenced by range;
+beyond that the parent refuses every write.
+
+**Host duties.**
+* `VDriveRefresh(&vd, cfg, unit)` when a unit's medium is new, from a task
+  that is not the parent's I/O task (it reads the partition table). It returns
+  how many slots are online; mount those units with `MSF_NO_LEGACY |
+  MSF_NO_CD | MSF_IGNORE_LAST`.
+* `VDriveParentGone(vd, unit)` when the medium or the unit goes: no I/O, safe
+  from any task.
+* `VDriveDestroy(vd)` before expunging, and only when the host's open count
+  is down to `VDriveHeldOpens(vd)` (plus its own): the device holds every
+  parent unit that had a virtual drive open. It refuses while one of its units
+  is open.
 
 ---
 
