@@ -66,13 +66,16 @@ static BOOL is_unit_ready(struct MountData *md, struct IOStdReq *req)
 
 
 // Disc classes derived from the TOC.
-#define CDDISC_UNKNOWN 0	// TOC unreadable/implausible (blank disc, drive error)
-#define CDDISC_DATA    1	// track 1 is a data track
-#define CDDISC_AUDIO   2	// track 1 is an audio track
+enum CdDisc
+{
+	CDDISC_UNKNOWN,     /* TOC unreadable/implausible (blank disc, drive error) */
+	CDDISC_DATA,        /* track 1 is a data track */
+	CDDISC_AUDIO,       /* track 1 is an audio track */
+};
 
 /**
  * classify_cd() - Classify the disc by reading the TOC and checking track 1's data-track bit.
- * @md:  mount state; only md->SysBase is used
+ * @md:  mount state; the TOC is read into one of its scratch sectors
  * @ior: the unit's open request, DoIO()'d with HD_SCSICMD; io_Command, io_Data
  *       and io_Length are overwritten
  *
@@ -81,133 +84,149 @@ static BOOL is_unit_ready(struct MountData *md, struct IOStdReq *req)
  * descriptor's control nibble.
  *
  * Return: CDDISC_DATA or CDDISC_AUDIO by that bit; CDDISC_UNKNOWN if the TOC
- * cannot be read (allocation failure, I/O error or CHECK CONDITION on every
- * try) or does not start at track 1
+ * cannot be read (no scratch sector, I/O error or CHECK CONDITION on every try)
+ * or does not start at track 1
  */
-static int classify_cd(struct MountData *md, struct IOStdReq *ior)
+static enum CdDisc classify_cd(struct MountData *md, struct IOStdReq *ior)
 {
 	struct ExecBase *SysBase = md->SysBase;
-	int ret = CDDISC_UNKNOWN;
+	enum CdDisc ret = CDDISC_UNKNOWN;
+	_Static_assert(sizeof(struct SCSI_CD_TOC) <= MAX_BLOCKSIZE, "TOC in a scratch sector");
 
-	BYTE err;
+	struct SCSI_CD_TOC *toc = (struct SCSI_CD_TOC *)mnt_sector_take(md);
+	if (!toc)
+		return ret;
+	// What is read below: a TOC cut short leaves these as zeros.
+	memset(toc, 0, offsetof(struct SCSI_CD_TOC, td[1]));
 
-	struct SCSICmd     *scsiCmd = NULL;
-	struct SCSI_CD_TOC *tocBuf  = NULL;
+	const ULONG bufSize = sizeof(struct SCSI_CD_TOC);
+	UBYTE cdb[10] = {
+		[0] = SCSI_CMD_READ_TOC,
+		[2] = 0,                     // Format: 0
+		[6] = 1,                     // Track 1
+		[7] = (UBYTE)(bufSize >> 8),
+		[8] = (UBYTE)(bufSize & 0xFF),
+	};
+	struct SCSICmd scsiCmd = {
+		.scsi_Data      = (UWORD *)toc,
+		.scsi_Length    = bufSize,
+		.scsi_Flags     = SCSIF_READ,
+		.scsi_CmdLength = sizeof(cdb),
+		.scsi_Command   = cdb,
+	};
 
-	ULONG bufSize = sizeof(struct SCSI_CD_TOC);
+	ior->io_Data    = &scsiCmd;
+	ior->io_Length  = sizeof(struct SCSICmd);
+	ior->io_Command = HD_SCSICMD;
 
-	UBYTE cdb[10];
-	memset(&cdb,0,10);
-
-	if ((scsiCmd = AllocMem(sizeof(struct SCSICmd),MEMF_PUBLIC | MEMF_CLEAR))) {
-		if ((tocBuf = AllocMem(bufSize,MEMF_PUBLIC | MEMF_CLEAR))) {
-			scsiCmd->scsi_Data      = (UWORD *)tocBuf;
-			scsiCmd->scsi_Length    = bufSize;
-			scsiCmd->scsi_Flags     = SCSIF_READ;
-			scsiCmd->scsi_CmdLength = 10;
-			scsiCmd->scsi_Command   = cdb;
-
-			cdb[0] = SCSI_CMD_READ_TOC;
-			cdb[2] = 0;                  // Format: 0
-			cdb[6] = 1;                  // Track 1
-			cdb[7] = (UBYTE)(bufSize >> 8);
-			cdb[8] = (UBYTE)(bufSize & 0xFF);
-
-			ior->io_Data    = scsiCmd;
-			ior->io_Length  = sizeof(struct SCSICmd);
-			ior->io_Command = HD_SCSICMD;
-
-			for (int retry = 0; retry < 3; retry++) {
-				if ((err = DoIO((struct IORequest *)ior)) == 0 && scsiCmd->scsi_Status == 0)
-					break;
-			}
-
-			// The loop also falls out on exhausted retries, so re-test
-			// what it was waiting for. io_Error alone is not enough: a
-			// CHECK CONDITION completes the request cleanly (err == 0)
-			// and reports the drive's refusal in scsi_Status, leaving
-			// the MEMF_CLEAR TOC buffer at zeros.
-			if (err == 0 && scsiCmd->scsi_Status == 0) {
-				if (tocBuf->firstTrack == 1 && tocBuf->td[0].trackNumber == 1) {
-					// Data track bit
-					ret = (tocBuf->td[0].adrControl & 0x04) ? CDDISC_DATA : CDDISC_AUDIO;
-				}
-			}
-
-			FreeMem(tocBuf,bufSize);
-		}
-		FreeMem(scsiCmd,sizeof(struct SCSICmd));
+	BYTE err = 0;
+	for (int retry = 0; retry < 3; retry++) {
+		if ((err = DoIO((struct IORequest *)ior)) == 0 && scsiCmd.scsi_Status == 0)
+			break;
 	}
+
+	// The loop also falls out on exhausted retries, so re-test what it was
+	// waiting for. io_Error alone is not enough: a CHECK CONDITION completes
+	// the request cleanly (err == 0) and reports the drive's refusal in
+	// scsi_Status.
+	if (err == 0 && scsiCmd.scsi_Status == 0) {
+		if (toc->firstTrack == 1 && toc->td[0].trackNumber == 1) {
+			// Data track bit
+			ret = (toc->td[0].adrControl & 0x04) ? CDDISC_DATA : CDDISC_AUDIO;
+		}
+	}
+
+	mnt_sector_drop(md, (UBYTE *)toc);
 	return ret;
 }
 
-// read_pvd results. Only PVD_AMIGABOOT decides anything about the disc's
-// contents; the rest tell mnt_scan_cd how much it may assume. PVD_NONE is not a
-// rejection - plenty of formats the CD handler reads (High Sierra, plain UDF,
-// HFS/HFS+) have nothing at all at sector 16 offset 1.
-#define PVD_ERROR      -2	// sector 16 unreadable, or no buffer to read it into
-#define PVD_NONE       -1	// readable, but no ISO9660 PVD
-#define PVD_DATA        0	// ISO9660, not Amiga-bootable
-#define PVD_AMIGABOOT   1	// ISO9660 with "CDTV" or "AMIGA BOOT" as the System ID
+// read_pvd results, in order: everything below PVD_DATA is "no ISO9660 PVD".
+// Only PVD_AMIGABOOT decides anything about the disc's contents; the rest tell
+// mnt_scan_cd how much it may assume. PVD_NONE is not a rejection - plenty of
+// formats the CD handler reads (High Sierra, plain UDF, HFS/HFS+) have nothing
+// at all at sector 16 offset 1.
+enum Pvd
+{
+	PVD_ERROR = -2,     /* sector 16 unreadable, or no buffer to read it into */
+	PVD_NONE,           /* readable, but no ISO9660 PVD */
+	PVD_DATA,           /* ISO9660, not Amiga-bootable */
+	PVD_AMIGABOOT,      /* ISO9660 with "CDTV" or "AMIGA BOOT" as the System ID */
+};
+
+// Byte offset of the ISO9660 Primary Volume Descriptor: 2048-byte sector 16.
+#define PVD_OFFSET 32768
+
+// The first fields of an ISO 9660 volume descriptor (ECMA-119 8.4), all that
+// read_pvd() looks at. Bytes only, so there is no padding.
+struct IsoVolumeDescriptor
+{
+	UBYTE type;             /* 1: the Primary Volume Descriptor */
+	char  standardId[5];    /* "CD001" in every ISO 9660 volume descriptor */
+	UBYTE version;          /* 1 */
+	UBYTE unused;
+	char  systemId[32];     /* the system that may use the disc's first 16 sectors; space-padded */
+};
+_Static_assert(offsetof(struct IsoVolumeDescriptor, systemId) == 8, "ISO 9660 descriptor layout");
+
+/**
+ * id_starts_with() - Tell whether an ISO 9660 identifier field begins with a text.
+ * @id:     the field; space-padded, not NUL-terminated
+ * @prefix: the text, a C string no longer than the field
+ *
+ * Return: TRUE if the field's first strlen(@prefix) chars are @prefix; FALSE
+ * otherwise
+ */
+static BOOL id_starts_with(const char *id, const char *prefix)
+{
+	return memcmp(id, prefix, strlen(prefix)) == 0;
+}
 
 /**
  * read_pvd() - Read the ISO9660 Primary Volume Descriptor to decide boot priority.
- * @md:  mount state; only md->SysBase is used
- * @ior: the unit's open request, DoIO()'d with CMD_READ of 2048 bytes at byte
- *       offset 32768 (sector 16), up to three tries; io_Command, io_Data,
- *       io_Length and io_Offset are overwritten
+ * @md: mount state of the open unit; the block holding byte PVD_OFFSET is read
+ *      (mnt_read_block()) into one of its scratch sectors
  *
  * Is the System ID "CDTV" or "AMIGA BOOT"? Identifying the disc's format is the
- * CD filesystem's job, not ours.
+ * CD filesystem's job, not ours. The fields read lie in the descriptor's first 40
+ * bytes, so one block of any size holds them.
  *
  * Return: PVD_AMIGABOOT if sector 16 is an ISO9660 PVD (type 1, "CD001",
  * version 1) whose System ID starts with "CDTV" or "AMIGA BOOT"; PVD_DATA for
  * any other ISO9660 PVD; PVD_NONE if the sector reads but holds no PVD;
- * PVD_ERROR if it cannot be read, or the buffer cannot be allocated
+ * PVD_ERROR if it cannot be read, PVD_OFFSET is not on a block boundary, or no
+ * scratch sector is free
  */
-static LONG read_pvd(struct MountData *md, struct IOStdReq *ior)
+static enum Pvd read_pvd(struct MountData *md)
 {
-	struct ExecBase *SysBase = md->SysBase;
-	const char sys_id_1[] = "CDTV";
-	const char sys_id_2[] = "AMIGA BOOT";
-	const char iso_id[]   = "CD001";
+	if (PVD_OFFSET % md->blocksize)
+		return PVD_ERROR;
+	UBYTE *buf = mnt_sector_take(md);
+	if (!buf)
+		return PVD_ERROR;
+	enum Pvd ret = PVD_ERROR;
 
-	BYTE err = 0;
-	LONG ret = PVD_ERROR;
-	char *buf = NULL;
-
-	if (!(buf = AllocMem(2048,MEMF_ANY|MEMF_CLEAR))) goto done;
-
-	char *id_string = buf + 1;
-	char *system_id = buf + 8;
-
-	ior->io_Command = CMD_READ;
-	ior->io_Data    = buf;
-	ior->io_Length  = 2048;
-	ior->io_Offset  = 32768; // Sector 16
-
-	for (int retry = 0; retry < 3; retry++) {
-		if ((err = DoIO((struct IORequest*)ior)) == 0) break;
+	if (mnt_read_block(buf, PVD_OFFSET / md->blocksize, md)) {
+		const struct IsoVolumeDescriptor *pvd = (const struct IsoVolumeDescriptor *)buf;
+		// An ISO 9660 disc has its Primary Volume Descriptor here: type 1,
+		// "CD001", version 1. Anything else is a disc of another format, for
+		// the CD filesystem to judge. An Amiga-bootable disc names itself in
+		// the System Identifier, as "AMIGA BOOT" or "CDTV".
+		if (pvd->type != 1 || memcmp(pvd->standardId, "CD001", 5) != 0 || pvd->version != 1)
+			ret = PVD_NONE;
+		else if (id_starts_with(pvd->systemId, "AMIGA BOOT") || id_starts_with(pvd->systemId, "CDTV"))
+			ret = PVD_AMIGABOOT;
+		else
+			ret = PVD_DATA;
 	}
 
-	if (err == 0) {
-		ret = PVD_NONE;
-		// Check ISO ID String & for PVD Version & Type code
-		if ((strncmp(iso_id,id_string,5) == 0) && buf[0] == 1 && buf[6] == 1) {
-			ret = (strncmp(sys_id_1,system_id,strlen(sys_id_1)) == 0 || strncmp(sys_id_2,system_id,strlen(sys_id_2)) == 0)
-			      ? PVD_AMIGABOOT : PVD_DATA;
-		}
-	}
-
-done:
-	if (buf)  FreeMem(buf,2048);
+	mnt_sector_drop(md, buf);
 	return ret;
 }
 
 /**
  * mnt_scan_cd() - Mount a CDROM as one whole-medium volume.
- * @md: mount state of the open unit; md->fs[MOUNTFS_CD] is the recipe, NULL
- *      for the classic CD01/CDVD entry in FileSystem.resource
+ * @md: mount state of the open unit; md->fs[MOUNTFS_CD] is the recipe, never
+ *      NULL (MountDrive() fills in the classic CD01/CDVD one)
  *
  * Amiga-bootable data discs get boot priority: 5, else MOUNT_NEVER_BOOT (an
  * RDB CD's partitions follow their RDB). What format the disc carries is the CD
@@ -227,25 +246,24 @@ done:
 BOOL mnt_scan_cd(struct MountData *md)
 {
 	const struct MountFS *fs = md->fs[MOUNTFS_CD];
-	struct MountFS classicCD;
 	LONG bootPri = MOUNT_NEVER_BOOT;
 
 	if (!is_unit_ready(md, (struct IOStdReq *)md->request))
 		return FALSE;
 
-	int disc = classify_cd(md, (struct IOStdReq *)md->request);
+	enum CdDisc disc = classify_cd(md, (struct IOStdReq *)md->request);
 
 	// Some enclosures answer READ TOC poorly for DVD/BD media - which is
 	// exactly the media UDF lives on. Give a self-identifying filesystem the
 	// benefit of the doubt; sector 16 still has to read back below.
-	if (disc == CDDISC_UNKNOWN && fs && (fs->fsFlags & MOUNTFS_CD_ANYFMT))
+	if (disc == CDDISC_UNKNOWN && (fs->fsFlags & MOUNTFS_CD_ANYFMT))
 		disc = CDDISC_DATA;
 
 	switch (disc) {
 	case CDDISC_DATA:
 	{
 		// "CDTV" or "AMIGA BOOT"?
-		LONG pvd = read_pvd(md, (struct IOStdReq *)md->request);
+		enum Pvd pvd = read_pvd(md);
 
 		if (pvd < PVD_DATA) {
 			// No ISO9660 PVD. RDB CD?
@@ -255,8 +273,8 @@ BOOL mnt_scan_cd(struct MountData *md)
 			// Not RDB either. A filesystem that identifies formats
 			// itself still reads this disc; a PVD-only one does not,
 			// and an unreadable sector 16 is nobody's disc.
-			if (pvd == PVD_ERROR || !fs || !(fs->fsFlags & MOUNTFS_CD_ANYFMT)) {
-				printf("Unrecognized disc.\n");
+			if (pvd == PVD_ERROR || !(fs->fsFlags & MOUNTFS_CD_ANYFMT)) {
+				mnt_log("Unrecognized disc.\n");
 				return FALSE;
 			}
 			// Mountable, but nothing on it claims to be bootable.
@@ -267,40 +285,25 @@ BOOL mnt_scan_cd(struct MountData *md)
 	}
 	case CDDISC_AUDIO:
 		// No PVD to check: audio sectors are not readable via CMD_READ.
-		if (!fs || !(fs->fsFlags & MOUNTFS_CD_AUDIO)) {
-			printf("Audio disc and no audio-capable CD filesystem.\n");
+		if (!(fs->fsFlags & MOUNTFS_CD_AUDIO)) {
+			mnt_log("Audio disc and no audio-capable CD filesystem.\n");
 			return FALSE;
 		}
 		break;
-	default:
-		printf("Unrecognized disc TOC.\n");
+	case CDDISC_UNKNOWN:
+		mnt_log("Unrecognized disc TOC.\n");
 		return FALSE;
 	}
 
 	// From here on the disc is recognized, whatever becomes of its volume: a
 	// filesystem that has to wait for DOS, or none at all, mounts nothing.
-	if (!fs) {
-		// No recipe: classic behavior, CD01/CDVD from FileSystem.resource only.
-		struct FileSysEntry *fse = mnt_find_filesystem(0x43443031, 0x43445644, md->SysBase);
-		if (!fse) {
-			printf("Could not load filesystem\n");
-			return TRUE;
-		}
-		memset(&classicCD, 0, sizeof(classicCD));
-		classicCD.dosType = fse->fse_DosType; // CD01 / CDVD
-		fs = &classicCD;
-	} else if (!mnt_resolve_fs(md, fs, 0)) {
-		return TRUE;
-	}
-
-	// Whole-medium mount: the CD filesystem reads the disc directly, so LowCyl/
-	// HighCyl are left at 0.
+	// Whole-medium mount: the CD filesystem reads the disc directly, so its
+	// first and last block stay 0.
 	struct Volume vol = {
 		.fs       = fs,
 		.nameHint = fs->dosName ? fs->dosName : (const UBYTE *)"CD0",
 		.bootPri  = bootPri,
 	};
-	mnt_envec_from_recipe(md, &vol.pp.de, fs, 0, 0, bootPri);
 	mnt_mount_volume(md, &vol);
 	return TRUE;
 }

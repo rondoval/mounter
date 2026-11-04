@@ -3,7 +3,7 @@
 
 // Which filesystem family a recipe describes. Recipes are passed as an array
 // indexed by these, so adding a family later changes no signature.
-enum
+enum MountFSKind
 {
 	MOUNTFS_FAT,
 	MOUNTFS_NTFS,
