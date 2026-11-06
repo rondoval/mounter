@@ -287,7 +287,7 @@ mounter is the listing of a unit's virtual drives:
 | `vdrive.c` | The host's lifecycle calls: a rescan fences a parent's virtual drives and brings their units online, a parent that is gone takes them offline, the device goes when the host expunges |
 | `vdrive_fence.c` | The host's write checks on a parent unit |
 | `vdrive_device.c` | The exec device: making it, its vectors, the trackdisk commands |
-| `vdrive_forward.c` | The requests sent to the parent, and the soft interrupt that completes them |
+| `vdrive_forward.c` | The requests sent to the parent, and their completion when the host hands them back |
 | `vdrive_scsi.c` | The SCSI target behind `HD_SCSICMD`, and the CDB decoder the fence shares |
 | `vdrive_unit.c` | Parent records and units: made, looked up, read, freed |
 
@@ -308,9 +308,14 @@ flowchart TD
 ```
 
 `vdrive_internal.h` carries the records the units share and states the locking
-once: what a rescan changes, it changes under `Disable()`, so readers take
-`Disable()` too, or `Forbid()` from a task. A request reads its unit once, on
-arrival, into a copy it works from to the end.
+once; `vdrive_scsi.h` lays out the SCSI CDBs, parameter lists and responses as
+packed structures, which on a 68k read and write as they are. One lock guards
+all the device's state: `Forbid()`, which on a PiStorm costs no access across
+the Amiga bus where `Disable()` costs two. It is enough because nothing in the
+device runs at interrupt level: rescans, change interrupts, the write checks,
+and the requests to the parent, taken in the client's task and handed back in
+the host's, are all task code, and so is an abort. A request reads its unit
+once, on arrival, into a copy it works from to the end.
 
 **Creation.** The device is made by the first refresh that finds a virtual
 drive on any parent, and stays until the host expunges: units and parents are
@@ -321,13 +326,33 @@ from the host's task, at its first refresh.
 rewriting its device, unit, offset and reply port and restoring them afterwards
 would be fragile. The device sends a request of its own: the same buffer and
 length, at the virtual drive's offset, always as a 64-bit trackdisk command,
-replied to a port that raises a software interrupt instead of signalling a
-task. The trackdisk commands and the SCSI target both only describe what goes
-to the parent; one sender sends it, and fails the request at once when no
-request of its own can be had. The interrupt copies the result into the caller's request and replies
-it, so the device needs no task and completes each request the moment the
-parent does. Its requests come from a pool, four made with the device and more
-added when that many are in flight, so there is no allocation per I/O.
+with the device's own port as its reply port. Its requests come from a pool,
+four made with the device and more added when that many are in flight, so
+there is no allocation per I/O. The trackdisk commands and the SCSI target
+both only describe what goes to the parent; one sender sends it, and fails the
+request at once when no request of its own can be had. An `AbortIO()` of a
+forwarded request is passed on to the parent, which decides: a request still
+queued there comes back aborted, one it is executing completes as usual. The
+device keeps its requests in flight on a list for this, and for knowing when it
+may go.
+
+**Completion.** The host hands every finished request to the device before it
+replies it (`VDriveComplete()`), from its own task; the device takes back its
+own, recognised by the reply port, and completes the caller's request on the
+spot. Nothing else brings them back: the reply port only marks them, and one
+the host replied as a message would wait there for good, which the device
+logs when it is asked to go. So the device needs neither a task nor an
+interrupt, and the whole path runs under `Forbid()`.
+
+**Cost.** Measured on the CM4, a request through the virtual device takes
+about 1 µs longer than the same request sent to the parent directly,
+whatever its size: a few hundred instructions and two `Forbid()` pairs. The first design completed requests from a software
+interrupt on the reply port and took 45 µs: the interrupt's round trip through
+the Amiga's interrupt hardware alone is about 30 µs, and every `Disable()` pair
+5.6 µs, both being accesses across the Amiga bus on a PiStorm. A task of the
+device's own would have cost a task switch, about as much. A write check on a
+parent unit costs 0.2–0.3 µs, and nothing at all while no unit has a virtual
+drive.
 
 **Answered locally:** geometry, the change count and change interrupts,
 `NSCMD_DEVICEQUERY`, and enough of `HD_SCSICMD` for HDToolBox (INQUIRY, READ
@@ -335,10 +360,13 @@ CAPACITY, MODE SENSE pages 3 and 4, the READ, WRITE and VERIFY variants as
 forwarded requests, SYNCHRONIZE CACHE as an update). The last close of a unit
 sends the parent a `CMD_UPDATE`.
 
-**Write protection.** Each parent keeps the byte ranges of up to 16 virtual
-drives, and a flag that protects the whole unit when there are more. The
-host's write paths ask before every write; the device's own forwarded
-requests, known by their reply port, pass. The check runs under `Disable()`,
+**Write protection.** The blocks of a virtual drive with a unit are reachable
+two ways, through its unit and through the parent, so on the parent they are
+read-only to all but the virtual device; the fence is those units' own block
+ranges, at most ten per parent. A virtual drive without a unit, past the ten
+slots or too large for one, is reachable through the parent alone and stays
+writable there. The host's write paths ask before every write; the device's
+own forwarded requests, known by their reply port, pass. The check runs under `Forbid()`,
 since a refresh may change the ranges while the parent's I/O task asks. A
 medium that cannot be read takes the units offline but keeps the protection:
 nothing says the blocks stopped being virtual drives.

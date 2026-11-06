@@ -166,20 +166,28 @@ its first block, so the same volumes read alike here and on Emu68.
 system without virtual drives never gets one, and every other call accepts
 NULL.
 
+**A handle per parent unit.** With each of its own units the host also keeps a
+`struct VDriveParent *`, which `VDriveRefresh()` sets once that unit has had a
+virtual drive, and passes it to the calls about the unit. NULL means the unit
+has none, and those calls then return at once. A handle stays valid until
+`VDriveDestroy()`.
+
 **Units.** `VDRIVE_UNIT(parent, slot)` = `parent * 10 + slot`, the slot being
 the virtual drive's order on its parent unit. HDToolBox reads a unit number as
 address + 10 × LUN, so it shows the slot as the address and the parent unit as
-the LUN. Ten slots per parent are served; any more are write-protected but get
-no unit. A unit is at most 2^32 blocks.
+the LUN. Ten slots per parent are served, and a unit is at most 2^32 blocks; a
+virtual drive past them gets no unit and stays an ordinary partition of the
+parent.
 
-**Write protection on the parent.** On the parent unit the virtual drives'
-blocks are read-only to everyone but the virtual device, for up to 16 virtual
-drives per parent; with more, the parent refuses every write. The host asks on
-its write paths:
+**Write protection on the parent.** On the parent unit, the blocks of every
+virtual drive that has a unit are read-only to everyone but the virtual
+device, so that no two paths write the same blocks. A virtual drive without a
+unit is reachable through the parent alone, and writable there. The host asks
+on its write paths:
 
-- `VDriveWriteAllowed(vd, io, unit, offset, length)` for every write, format,
+- `VDriveWriteAllowed(parent, io, offset, length)` for every write, format,
   write-zeroes or trim, by byte range;
-- `VDriveScsiAllowed(vd, io, unit, cmd)` for `HD_SCSICMD`: reads and queries
+- `VDriveScsiAllowed(parent, io, scsi)` for `HD_SCSICMD`: reads and queries
   pass, WRITE, WRITE AND VERIFY and WRITE SAME are checked by range, UNMAP by
   descriptor, ATA PASS-THROUGH passes only for data-in, and anything else is
   refused with DATA PROTECT (07/27h) in the sense data.
@@ -189,19 +197,23 @@ A refused write completes with `TDERR_WriteProt`, a refused SCSI command with
 
 **Host duties.**
 
-- `VDriveRefresh(&vd, cfg, unit)` when a unit's medium is new, from a task
-  that is not the parent's I/O task (it reads the partition table). It returns
-  how many slots are online; mount those units with `MSF_NO_LEGACY |
-  MSF_NO_CD | MSF_IGNORE_LAST`.
-- `VDriveParentGone(vd, unit)` when the medium or the unit goes: no I/O, safe
+- `VDriveRefresh(&device, config, parentUnit, &parent)` when a unit's medium is
+  new, from a task that is not the parent's I/O task (it reads the partition
+  table). It sets the unit's handle and returns how many slots are online;
+  mount those units with `MSF_NO_LEGACY | MSF_NO_CD | MSF_IGNORE_LAST`.
+- `VDriveParentGone(parent)` when the medium or the unit goes: no I/O, safe
   from any task.
-- `VDriveAnyFenced(vd)` before a command that wipes the whole device, which no
-  unit's check can cover (an NVMe Format or Sanitize): refuse it while this is
-  TRUE.
-- `VDriveDestroy(vd)` before expunging, and only when the host's open count is
-  down to `VDriveHeldOpens(vd)` (plus its own): the device keeps every parent
-  unit that had a virtual drive open. It refuses while one of its own units is
-  open.
+- `VDriveComplete(device, io)` on every path that replies a finished request,
+  from a task, never an interrupt, and `ReplyMsg()` only when it returns FALSE.
+  The virtual device's own requests come back no other way: one that is
+  `ReplyMsg()`ed is never completed, and its client waits for good.
+- `VDriveAnyFenced(device)` before a command that wipes the whole device, which
+  no unit's check can cover (an NVMe Format or Sanitize): refuse it while this
+  is TRUE.
+- `VDriveDestroy(device)` before expunging, and only when the host's open count
+  is down to `VDriveHeldOpens(device)` (plus its own): the device keeps every
+  parent unit that had a virtual drive open. It refuses while one of its own
+  units is open.
 
 `VDriveRefresh()` and `VDriveDestroy()` do I/O and change the device: make
 them from one task at a time.

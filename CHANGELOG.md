@@ -32,8 +32,40 @@ changed.
 
 ## 2026-11-04 — the virtual-drive device in six units
 
+### Added
+
+- **`VDriveComplete(vd, io)`**: a host hands every finished request to it, from
+  a task, before replying, and replies only on FALSE; the virtual device's own
+  requests complete on the spot, and come back no other way. It replaces the
+  software interrupt that completed them, and the `Disable()` that interrupt
+  needed: measured on the CM4, a request through the virtual device costs
+  1 µs more than a direct one instead of 57 µs. nvme.device (`nvme_reply()`)
+  and usbscsi.device (`nReplyIO()`) call it on every reply path.
+
 ### Changed
 
+- **A host names a parent unit by a handle** (`struct VDriveParent *`), kept
+  with its own unit: `VDriveRefresh()` takes a fourth argument and sets it
+  once the unit has had a virtual drive, and `VDriveParentGone()`,
+  `VDriveWriteAllowed()` and `VDriveScsiAllowed()` take it in place of the
+  device and the unit number. The write checks no longer search the device's
+  list of parents, and a unit that never had a virtual drive passes on a NULL
+  test even while another unit has some. nvme.device keeps it in
+  `NVMeUnit.vdParent`, usbscsi.device in `ncm_VDriveParent`.
+- **`AbortIO()` on a virtual unit reaches the parent**: a read or write the
+  client aborts is aborted on the parent unit too, which takes it off its
+  queue if it has not started it (nvme.device and usbscsi.device both can), and
+  the request comes back with `IOERR_ABORTED`; an emulated `HD_SCSICMD` does
+  too, without sense data. Only change interrupts could be aborted before.
+- **READ CAPACITY (10) and (16) on a virtual unit follow SBC-2's PMI**: without
+  PMI the LBA must be 0 (else invalid field in CDB) and the answer is the last
+  block, as before; with PMI the answer is the last block of the track holding
+  the LBA, in the unit's own geometry. They answered with the drive's last block whatever the CDB said.
+- **Only the virtual drives that have a unit are write-protected on the
+  parent**: the protection keeps two paths from writing the same blocks, and a
+  virtual drive with no unit (past the tenth, or of 2^32 blocks or more) has
+  one path only, so it stays an ordinary, writable partition of the parent. Up
+  to 16 were protected before, and a parent with more refused every write.
 - **`VDriveAnyContainers()` is `VDriveAnyFenced()`**, the last "container" in
   the API; hosts rename the call.
 - **`mounter.cmake` lists the virtual-drive device too** (`VDRIVE_SOURCES`);
@@ -43,28 +75,55 @@ changed.
   unreadable, which kept the previous medium's fence.
 - `vdrive.h` says what both hosts already do: `VDriveRefresh()` and
   `VDriveDestroy()` are called from one task at a time.
+- **Faster on a PiStorm, where every `Disable()` writes across the Amiga bus
+  (5.6 µs a pair, measured on the CM4).** Everything the device shares is
+  guarded by `Forbid()` instead, since `VDriveComplete()` left nothing at
+  interrupt level: a unit's state and its change interrupts, the rescans, the
+  write checks, and the pool of requests to the parent. A write check on the
+  parent costs 0.2 µs, down from 5.9 µs. `AbortIO()` on a virtual unit is
+  called from a task, as on both hosts.
 
 ### Internal
 
 - **Six units, calls one way**, in place of one file of 1600 lines: the host's
   lifecycle calls (`vdrive.c`), the write checks (`vdrive_fence.c`), the exec
-  device (`vdrive_device.c`), the requests to the parent and their soft
-  interrupt (`vdrive_forward.c`), the SCSI target (`vdrive_scsi.c`), and the
-  parent and unit records (`vdrive_unit.c`). `vdrive_internal.h` maps them and
-  states the locking once.
+  device (`vdrive_device.c`), the requests to the parent and their completion
+  (`vdrive_forward.c`), the SCSI target (`vdrive_scsi.c`), and the parent and
+  unit records (`vdrive_unit.c`). `vdrive_internal.h` maps them and states the
+  locking and the naming once.
 - **The SCSI target does no I/O.** A command that needs the parent comes back
-  as a transfer, sent like a trackdisk one. Sending, and failing the request
-  when no child request can be had, is one function; five call sites did it
-  each their own way. The trackdisk block commands are a table of what each
-  becomes on the parent.
+  as a wrapped request drafted on the caller's stack (the forwarded request's
+  command, buffer, length and offset, the client's request and its unit), sent
+  like a trackdisk one. Sending a copy of the draft, and failing the request
+  when no wrapped request can be had, is one function of two arguments; five
+  call sites did it each their own way. The trackdisk block commands are cases
+  of BeginIO's switch, each naming what it becomes on the parent.
 - **The mounter lists a unit's virtual drives itself**:
   `mnt_find_virtual_drives()`, in `mounter.c` beside `MountDrive()`, with the
   same open, geometry and close as a mount pass. The virtual device no longer
   opens the unit or reads its geometry itself, and it takes the table's own
   entries; `struct MountContainer` is gone.
-- A parent's fence is a list of extents. The change-interrupt search, the
-  device teardown, and the test of whether a request is checked at all are
-  each written once.
+- A parent's fence is its fenced units' own block ranges, with no list of its
+  own. The change-interrupt search, the device teardown, and the test of
+  whether a request is checked at all are each written once.
+- **One naming scheme**: the host's names start `VDrive`, what the units share
+  `vd_`, `VD` or `VD_`, a unit's own carry no prefix, and every function names
+  its object first, in full words (`device`, `unit`, `parent`, not `vd`,
+  `vu`, `p`). A request sent to the parent travels in a `struct VDWrappedIO`,
+  wrapped with the client's request it completes. It is a plain `IOStdReq`, 8
+  bytes smaller than the `IOExtTD` it was: nothing sent is an `ETD_` command,
+  so its `iotd_Count` was never read.
+- **The SCSI wire formats are structures** (`vdrive_scsi.h`): every CDB the
+  target or the fence reads, UNMAP's parameter list, and every response
+  (sense, INQUIRY, READ CAPACITY, the mode pages), packed and in the 68k's own
+  byte order, so a field reads and writes as it is and the byte-by-byte
+  helpers are gone. Opcodes, status, sense keys and sense codes have their
+  standard names, the CDB decoder has one switch of opcodes, and the sizes
+  the standards give are checked at compile time.
+- No number stands for a meaning any more: the `ETD_` commands are listed by
+  name (a bit test also caught the 64-bit NSD commands' bit 15), the slot of a
+  unit number is `VDRIVE_SLOT()`, and brcm-emmc's geometry has names. The set-up
+  of a port that signals nobody is written once.
 
 ## 2026-11-04 — nine units, the partition table read first
 
