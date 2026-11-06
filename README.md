@@ -222,15 +222,15 @@ How the device works inside is in ARCHITECTURE.md section 9.
 
 ## 6. License
 
-Copyright 2021-2022 Toni Wilen
+BSD-2-Clause; the full text is in [LICENSE](LICENSE), and every source file
+carries an `SPDX-License-Identifier` line.
 
-The MBR/GPT on-disk structures (`legacy.h`) are Copyright 2022-2023
-Stefan Reinauer & Chris Hooper (BSD-2-Clause, from a4091-software).
+- Copyright 2021-2022 Toni Wilen, the original mounter, extended upstream
+  (A4091/mounter) by Stefan Reinauer and Matt Harlum.
+- Copyright 2022-2023 Stefan Reinauer & Chris Hooper: the MBR/GPT on-disk
+  structures in `legacy.h`, from a4091-software.
+- Copyright 2026 rondoval: this fork's changes, and the virtual-drive device.
 
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are met:
-1. Redistributions of source code must retain the above copyright notice, this
-   list of conditions and the following disclaimer.
-2. Redistributions in binary form must reproduce the above copyright notice,
-   this list of conditions and the following disclaimer in the documentation
-   and/or other materials provided with the distribution.
+A driver that ships the mounter in a binary must reproduce the copyright
+notices, the two conditions and the disclaimer in its documentation (clause 2):
+shipping this LICENSE file does it.

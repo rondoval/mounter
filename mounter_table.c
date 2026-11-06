@@ -1,9 +1,9 @@
-
+// SPDX-License-Identifier: BSD-2-Clause
 // mounter_table.c — the partition table: an MBR with its EBR chains, a GPT, or a
 // superfloppy (a filesystem straight at block 0), read once per unit into
 // md->table. The scanners and the virtual-drive scan all work from that copy.
 //
-// Part of the generic autoboot/automount mounter; see mounter.c for the
+// Part of the generic autoboot/automount mounter; see LICENSE for the
 // copyright and licence covering this file.
 #include "mounter_internal.h"
 #include "legacy.h"

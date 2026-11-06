@@ -1,3 +1,4 @@
+| SPDX-License-Identifier: BSD-2-Clause
 | bootpoint.S -- autoboot DiagArea + BootPoint for volumes mounted before DOS.
 |
 | RKRM (Libraries, "ROM Based and Autoboot Drivers" -> Events At BOOT Time):

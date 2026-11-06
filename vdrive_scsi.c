@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive_scsi.c — the SCSI target a virtual unit emulates behind HD_SCSICMD, for
  * HDToolBox and other partitioning tools, and the CDB decoder the parent fence
@@ -5,7 +6,7 @@
  * wrapped request for the caller to forward. The wire formats are
  * vdrive_scsi.h's.
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  */
 #include "vdrive_internal.h"

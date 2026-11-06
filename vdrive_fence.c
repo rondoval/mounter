@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive_fence.c — the write fence on a parent unit: there, the blocks of every
  * virtual drive that has a unit are read-only to everyone but the virtual
@@ -6,7 +7,7 @@
  * I/O and no allocation here, only Forbid() around the fence read, the lock of
  * all the device's state (vdrive_internal.h).
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  */
 #include "vdrive_internal.h"

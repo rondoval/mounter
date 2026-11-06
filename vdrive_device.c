@@ -1,9 +1,10 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive_device.c — the virtual-drive device itself: its making, its vectors,
  * and the trackdisk commands, answered here or sent on to the parent unit
  * (vdrive_forward.c). HD_SCSICMD is vdrive_scsi.c's.
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  */
 #include "vdrive_internal.h"

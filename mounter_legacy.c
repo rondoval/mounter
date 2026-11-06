@@ -1,8 +1,8 @@
-
+// SPDX-License-Identifier: BSD-2-Clause
 // mounter_legacy.c — non-RDB media: mounts the FAT, NTFS and exFAT volumes of
 // the unit's partition table (mounter_table.c), a superfloppy included.
 //
-// Part of the generic autoboot/automount mounter; see mounter.c for the
+// Part of the generic autoboot/automount mounter; see LICENSE for the
 // copyright and licence covering this file.
 #include "mounter_internal.h"
 

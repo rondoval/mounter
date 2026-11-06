@@ -1,8 +1,9 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive_unit.c — parent records and the units of their virtual drives: made,
  * looked up, read and freed. What a rescan changes in them is vdrive.c's.
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  */
 #include "vdrive_internal.h"

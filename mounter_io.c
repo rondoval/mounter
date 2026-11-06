@@ -1,8 +1,8 @@
-
+// SPDX-License-Identifier: BSD-2-Clause
 // mounter_io.c — reading the unit being scanned: blocks, raw or as checked RDB
 // blocks, and the scratch sectors to read them into.
 //
-// Part of the generic autoboot/automount mounter; see mounter.c for the
+// Part of the generic autoboot/automount mounter; see LICENSE for the
 // copyright and licence covering this file.
 #include "mounter_internal.h"
 

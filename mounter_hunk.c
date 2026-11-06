@@ -1,8 +1,8 @@
-
+// SPDX-License-Identifier: BSD-2-Clause
 // mounter_hunk.c — filesystems loaded off the disk: the RDB's LoadSegBlock chain
 // read as a stream, and the hunk loader that relocates the load file it holds.
 //
-// Part of the generic autoboot/automount mounter; see mounter.c for the
+// Part of the generic autoboot/automount mounter; see LICENSE for the
 // copyright and licence covering this file.
 #include "mounter_internal.h"
 

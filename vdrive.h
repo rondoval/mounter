@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive.h — virtual drives as units of a device of their own.
  *

@@ -1,9 +1,9 @@
-
+// SPDX-License-Identifier: BSD-2-Clause
 // mounter_volume.c — volumes into DOS devices: the one path that creates a
 // DeviceNode, with the duplicate guard, the DOS naming rules and the boot-node
 // decision it needs.
 //
-// Part of the generic autoboot/automount mounter; see mounter.c for the
+// Part of the generic autoboot/automount mounter; see LICENSE for the
 // copyright and licence covering this file.
 #include "mounter_internal.h"
 

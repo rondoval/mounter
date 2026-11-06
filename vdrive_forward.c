@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive_forward.c — the requests a virtual unit sends to its parent unit, and
  * their completion.
@@ -11,7 +12,7 @@
  * task of the device's own. Everything here runs in tasks, under Forbid() like
  * all the device's state (vdrive_internal.h).
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  */
 #include "vdrive_internal.h"

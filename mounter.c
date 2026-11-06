@@ -1,4 +1,4 @@
-
+// SPDX-License-Identifier: BSD-2-Clause
 // Generic autoboot/automount RDB parser and mounter.
 // - AmigaOS 3.1 (V40) and up.
 // - 68000 compatible.
@@ -22,6 +22,8 @@
 // 2. Redistributions in binary form must reproduce the above copyright notice,
 //    this list of conditions and the following disclaimer in the documentation
 //    and/or other materials provided with the distribution.
+//
+// The full licence, its disclaimer included, is in LICENSE.
 //
 #include "mounter_internal.h"
 

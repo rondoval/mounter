@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * legacy.h — MBR/GPT on-disk partition structures for the mounter's partition
  * table.

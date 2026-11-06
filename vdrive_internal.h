@@ -1,8 +1,9 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive_internal.h — what the units of the virtual-drive device share; the host's
  * side is vdrive.h.
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  *
  * The units, each calling only those listed after it:

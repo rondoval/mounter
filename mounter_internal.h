@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: BSD-2-Clause
 // mounter_internal.h — what the mounter's units share: the state of one
 // MountDrive() call, the volume and partition-table types, and one section of
 // prototypes per unit. The sections run bottom-up: a unit calls only into the
@@ -13,6 +14,8 @@
 // 2. Redistributions in binary form must reproduce the above copyright notice,
 //    this list of conditions and the following disclaimer in the documentation
 //    and/or other materials provided with the distribution.
+//
+// The full licence, its disclaimer included, is in LICENSE.
 //
 #ifndef MOUNTER_INTERNAL_H
 #define MOUNTER_INTERNAL_H

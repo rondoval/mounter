@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: BSD-2-Clause
 # The mounter's sources, for a host to add to its target: include() this file,
 # then list ${MOUNTER_SOURCES}; ${MOUNTER_C_SOURCES} is the C files alone, for
 # per-file compile options. A host that serves virtual drives adds

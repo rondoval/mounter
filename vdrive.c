@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive.c — virtual drives as units of a device of their own: the host's
  * lifecycle calls. A rescan of a parent unit fences its virtual drives and brings
@@ -5,7 +6,7 @@
  * goes when the host expunges. vdrive.h is the host's side; vdrive_internal.h
  * maps the other units.
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  */
 #include "vdrive_internal.h"

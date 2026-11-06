@@ -1,9 +1,9 @@
-
+// SPDX-License-Identifier: BSD-2-Clause
 // mounter_fs.c — filesystems: FileSystem.resource lookups and the entries an
 // RDB's FSHD blocks add to it, the choice between a resource entry and a
 // recipe's handler file, and attaching that choice to a DeviceNode.
 //
-// Part of the generic autoboot/automount mounter; see mounter.c for the
+// Part of the generic autoboot/automount mounter; see LICENSE for the
 // copyright and licence covering this file.
 #include "mounter_internal.h"
 

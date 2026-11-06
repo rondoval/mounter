@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
 /*
  * vdrive_scsi.h — the SCSI wire formats the virtual units' SCSI target builds
  * and the parent fence reads: operation codes, status and sense codes, the CDBs
@@ -9,7 +10,7 @@
  * reach a field byte by byte where the CPU traps on an odd address (a 68000 or
  * 68010), since a CDB and the buffers a client hands over may sit anywhere.
  *
- * Part of the generic autoboot/automount mounter; see mounter.c for the
+ * Part of the generic autoboot/automount mounter; see LICENSE for the
  * copyright and licence covering this file.
  */
 #ifndef VDRIVE_SCSI_H
