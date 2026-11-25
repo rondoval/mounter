@@ -145,7 +145,7 @@ exist once.
 
 ```mermaid
 flowchart TD
-    v["a volume"] --> ext{"same device, unit,<br/>geometry and blocks<br/>already mounted?"}
+    v["a volume"] --> ext{"same device, unit,<br/>block size and blocks<br/>already mounted?"}
     ext -- yes --> already["left alone: already mounted"]
     ext -- no --> fsq{"a filesystem for it?"}
     fsq -- "not before DOS" --> def["deferred"]
@@ -162,9 +162,14 @@ naming step ran first, a second pass over a mounted stick renamed `CD0` to
 `CD1` and mounted a second handler on the same medium, which surfaced mid-boot
 as "Please replace volume".
 
-**The duplicate guard** compares device, unit, block size, geometry and
-cylinder range against every node already on the expansion mount list and,
-once DOS exists, in the DOS device list. The device name, not the DOS name, is
+**The duplicate guard** compares device, unit, block size and the first and
+last block, each worked out in its own environment's geometry, against every
+node already on the expansion mount list and, once DOS exists, in the DOS
+device list. Blocks, not geometry fields, because a handler may rewrite its
+node's geometry once it runs: fat95 turns a partition at block 63 made with
+one block per track into the same blocks at 63 per track. The fields are
+compared only when a geometry cannot be turned into blocks (empty, or past 32
+bits). The device name, not the DOS name, is
 the identity, so two drives that both want `CD0` are still told apart. A DOS
 device's startup field is a `FileSysStartupMsg` only for a filesystem (SER:,
 PAR: and PRT: keep a number there), so it is believed only when it, its

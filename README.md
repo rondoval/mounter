@@ -35,8 +35,9 @@ Rules that hold for every medium:
   digit (`UMSD` becomes `UMSD0`), since every volume of that recipe asks for
   it. A name already in use, before or after DOS starts, is bumped (`UMSD1`, …,
   `UMSD10`).
-- **No volume twice.** A volume whose device, unit, geometry and blocks match a
-  DOS device that already exists is left alone. Calling `MountDrive()` again
+- **No volume twice.** A volume whose device, unit, block size and blocks match
+  a DOS device that already exists is left alone, whatever geometry that
+  device's environment shows by then. Calling `MountDrive()` again
   after DOS has started therefore mounts only what could not be mounted the
   first time.
 - **Untrusted media.** Every on-disk field is checked before it is used:
