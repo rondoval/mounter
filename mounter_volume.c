@@ -88,6 +88,59 @@ static BOOL bstr_equal_ci(const UBYTE *bstr, const UBYTE *chars, UWORD len)
 }
 
 /**
+ * extent_blocks() - Turn a DosEnvec's cylinder range into its first and last block.
+ * @de:    the environment; its de_TableSize covers de_HighCyl
+ * @first: receives the first block of the extent
+ * @last:  receives its last block
+ *
+ * Return: TRUE with @first and @last set; FALSE if the geometry is empty, the
+ * range runs backwards or the numbers do not fit 32 bits
+ */
+static BOOL extent_blocks(const struct DosEnvec *de, ULONG *first, ULONG *last)
+{
+	if (!de->de_Surfaces || !de->de_BlocksPerTrack || de->de_HighCyl < de->de_LowCyl ||
+	    de->de_BlocksPerTrack > 0xFFFFFFFFUL / de->de_Surfaces) {
+		return FALSE;
+	}
+	const ULONG perCyl = de->de_Surfaces * de->de_BlocksPerTrack;
+	if (de->de_HighCyl == 0xFFFFFFFFUL || de->de_HighCyl + 1 > 0xFFFFFFFFUL / perCyl) {
+		return FALSE;
+	}
+	*first = de->de_LowCyl * perCyl;
+	*last  = (de->de_HighCyl + 1) * perCyl - 1;
+	return TRUE;
+}
+
+/**
+ * same_blocks() - Test whether two environments describe the same blocks.
+ * @have: the environment of an existing DeviceNode
+ * @want: the DosEnvec of the volume about to be mounted
+ *
+ * Not a comparison of the geometry fields: a node's environment can change
+ * after the mount. With fat95 (4.1 and 4.2, measured) the node of a FAT
+ * partition that starts at block 63, on a stick whose boot block says 63
+ * sectors per track, was made with BlocksPerTrack 1, LowCyl 63, HighCyl
+ * 1048319 and read BlocksPerTrack 63, LowCyl 1, HighCyl 16639 afterwards: the
+ * same blocks in other units. Compared field by field it never matched, and
+ * every re-probe of the unit mounted that partition again.
+ *
+ * Return: TRUE if both extents have the same first and last block; if one of
+ * them cannot be turned into blocks (extent_blocks()), TRUE only if the
+ * geometry and the cylinder range are equal field by field
+ */
+static BOOL same_blocks(const struct DosEnvec *have, const struct DosEnvec *want)
+{
+	ULONG haveFirst, haveLast, wantFirst, wantLast;
+
+	if (extent_blocks(have, &haveFirst, &haveLast) && extent_blocks(want, &wantFirst, &wantLast)) {
+		return (haveFirst == wantFirst) && (haveLast == wantLast);
+	}
+	return (have->de_Surfaces == want->de_Surfaces) &&
+	       (have->de_BlocksPerTrack == want->de_BlocksPerTrack) &&
+	       (have->de_LowCyl == want->de_LowCyl) && (have->de_HighCyl == want->de_HighCyl);
+}
+
+/**
  * is_same_extent() - Test whether a startup packet is our unit's, at this extent.
  * @md:      mount state: md->devicename and md->unitnum name the unit
  * @startup: a DeviceNode's dn_Startup; 0, a small integer or a BSTR allowed
@@ -98,8 +151,10 @@ static BOOL bstr_equal_ci(const UBYTE *bstr, const UBYTE *chars, UWORD len)
  * packet, its device name and its DosEnvec must all lie in RAM (TypeOfMem())
  * and de_TableSize must be plausible before anything in them is believed.
  *
- * The extent is the block size, the cylinder geometry and the cylinder range:
- * the same LowCyl/HighCyl under another geometry is another extent.
+ * The extent is the block size and the blocks the cylinder range covers in the
+ * environment's own geometry (same_blocks()): the same LowCyl/HighCyl under
+ * another geometry is another extent, and the same blocks under another
+ * geometry are the same one.
  *
  * Return: TRUE if this startup packet describes our device (md->devicename,
  * case-insensitive, its BSTR length counting the NUL or not), our unit and
@@ -124,10 +179,8 @@ static BOOL is_same_extent(struct MountData *md, BPTR startup, const struct DosE
 		return FALSE;
 	}
 
-	if (de->de_SizeBlock != want->de_SizeBlock || de->de_Surfaces != want->de_Surfaces ||
-	    de->de_SectorPerBlock != want->de_SectorPerBlock ||
-	    de->de_BlocksPerTrack != want->de_BlocksPerTrack ||
-	    de->de_LowCyl != want->de_LowCyl || de->de_HighCyl != want->de_HighCyl) {
+	if (de->de_SizeBlock != want->de_SizeBlock ||
+	    de->de_SectorPerBlock != want->de_SectorPerBlock || !same_blocks(de, want)) {
 		return FALSE;
 	}
 	// MakeDosNode() counts the terminating NUL in this BSTR's length

@@ -84,6 +84,17 @@ Removed, Internal (code structure, no change in behaviour).
 
 ### Fixed
 
+- **A mounted volume whose environment had changed was mounted again.**
+  `is_same_extent()` compared the geometry and the cylinder range field by
+  field. With fat95 (4.1 and 4.2) the node of a FAT partition that starts at
+  block 63, on a stick whose boot block says 63 sectors per track, was made
+  with `BlocksPerTrack` 1, `LowCyl` 63, `HighCyl` 1048319 and read
+  `BlocksPerTrack` 63, `LowCyl` 1, `HighCyl` 16639 afterwards: the same blocks
+  in other units. So a hub port power cycle, which brings the stick back
+  before anything is unmounted, mounted that partition a second time
+  (`UMSD2:` beside `UMSD0:`), once per cycle. The first and last block of both
+  environments are compared now; the fields only when a geometry is empty or
+  does not fit 32 bits.
 - **Hunk loader:**
   - The segment list linked each hunk to the one *before* it, so `fse_SegList`
     reached the first hunk only; it runs forward now, as `LoadSeg()` builds it.
